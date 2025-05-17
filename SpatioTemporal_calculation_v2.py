@@ -94,32 +94,27 @@ def compute_L_step_width_and_length(df, heel_strike_R, heel_strike_L, toe_off_L)
         right_stride_time.append(time[R_next] - time[R_idx])
 
         #step length and time 
-        # loop over each right‑foot stride
-        for i in range(len(heel_strike_R) - 1):
-            R0 = heel_strike_R[i]
-            R1 = heel_strike_R[i+1]
-
-            # find the left HS that falls between R0 and R1
-            candidates = [l for l in heel_strike_L if R0 < l <= R1]
-            if not candidates:
-                continue
-            L0 = candidates[0]
-
-            # 1) local forward direction D = unit vector from R0 → R1
-            v = np.array([rightXTraj[R1] - rightXTraj[R0],
-                      rightYTraj[R1] - rightYTraj[R0]])
-            norm = np.linalg.norm(v)
-            if norm == 0:
-                continue
-            D = v / norm
-
-            # 2) left step vector: from R0 to L0
-            vL = np.array([leftXTraj[L0] - rightXTraj[R0],
-                       leftYTraj[L0] - rightYTraj[R0]])
-            left_len = np.dot(vL, D) / 10   # convert mm→cm
-            left_step_length.append(left_len)
-            left_step_time.append(time[L0] - time[R0])
+        heel_strike_R_sorted = sorted(heel_strike_R)
+        heel_strike_L_sorted = sorted(heel_strike_L)
+        j = 0
         
+        for R_idx, L_idx in zip(heel_strike_R_sorted, heel_strike_R_sorted[1:]):
+        # avanzamos j hasta el primer HS-L después de R0
+            while j < len(heel_strike_L_sorted) and heel_strike_L_sorted[j] <= R_idx:
+                j += 1
+            if j >= len(heel_strike_L_sorted):
+                break
+            L0 = heel_strike_L_sorted[j]
+            if L0 > R_next:
+                continue  # el HS-L encontrado está fuera del intervalo
+
+            # longitud del step: entre talón L en L0 y talón R en R0
+            step_len = compute_distance(leftXTraj[L_idx], leftYTraj[L_idx], rightXTraj[R_idx], rightYTraj[R_idx])
+            left_step_length.append(step_len)
+
+            # tiempo del step
+            left_step_time.append(time[L_idx] - time[R_idx])
+                    
         #step width
         dist_R_to_L = compute_distance(rightXTraj[R_idx], rightYTraj[R_idx],
                                        leftXTraj[L_idx], leftYTraj[L_idx])
