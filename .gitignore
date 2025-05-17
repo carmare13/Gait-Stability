@@ -8,3 +8,5 @@
 NONAN_Library_main/
 prueba.ipynb
 *.json
+
+__pycache__/
