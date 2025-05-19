@@ -1,8 +1,9 @@
 #corrections for step lenght and time
-
+import os
 import numpy as np
 import pandas as pd
 from gait_events import gait_events_HC_JA
+from summary_utils import ensure_dir
 
 # function to calculate the eucledian distance in mm 
 def compute_distance(x1, y1, x2, y2, conversion=10):
@@ -281,7 +282,7 @@ def compute_stride_speed(stride_length, stride_time):
     stride_time_nonzero = np.where(stride_time == 0, np.nan, stride_time)
     return (stride_length / stride_time_nonzero) / 100
 
-# Función principal para calcular todas las variables espaciotemporales
+# Function to define spatiotemporal variables
 def compute_spatiotemporal_variables(df, heel_strike_R, heel_strike_L, toe_off_R, toe_off_L, sampling_rate):
     # Cálculos para el lado izquierdo (usando eventos del pie derecho y toe-off izquierdo)
     (right_stride_length, left_step_width, left_step_length,
@@ -422,3 +423,86 @@ def compute_spatiotemporal_variables(df, heel_strike_R, heel_strike_L, toe_off_R
     std_df=pd.DataFrame([std_spatiotemporal])
     
     return spatiotemporal_df, mean_df, std_df
+
+# function to calculate the gait events and spatiotemporal variables
+def process_spatiotemporal_for_patient(patient_df,
+                                       patient_id,
+                                       output_folder,
+                                       sampling_rate,
+                                       verbose=False):
+    """
+    For each trial in patient_df:
+      1) detect gait events
+      2) compute spatiotemporal variables (mean & std)
+    Then:
+      • aggregate all trial means into one DataFrame
+      • aggregate all trial stds  into one DataFrame
+      • save both as CSVs in output_folder
+    """
+    ensure_dir(output_folder)
+    mean_results = []
+    std_results  = []
+
+    # get distinct trials
+    trials = patient_df[['day','block','trial']].drop_duplicates()
+
+    for _, t in trials.iterrows():
+        d, b, tr = t['day'], t['block'], t['trial']
+        trial_name = f"{patient_id}_{d}_{b}_{tr}"
+        df_trial = patient_df[
+            (patient_df['day']==d) &
+            (patient_df['block']==b) &
+            (patient_df['trial']==tr)
+        ]
+
+        # 1) Gait‐event detection
+        try:
+            if verbose: print(f"Detecting gait events for {trial_name}...")
+            hs_R, hs_L, to_R, to_L = gait_events_HC_JA(df_trial)
+        except Exception as e:
+            print(f"[ERROR] gait-event detection failed on {trial_name}: {e}")
+            continue
+
+        if not hs_R or not to_R:
+            if verbose: print(f"[WARN] Skipping {trial_name}: insufficient events")
+            continue
+
+        # 2) Spatiotemporal computation
+        try:
+            if verbose: print(f"Computing spatiotemporal vars for {trial_name}...")
+            _, mean_df, std_df = compute_spatiotemporal_variables(
+                df_trial, hs_R, hs_L, to_R, to_L, sampling_rate
+            )
+            if mean_df.empty or std_df.empty:
+                if verbose: print(f"[WARN] Skipping {trial_name}: empty output")
+                continue
+        except Exception as e:
+            print(f"[ERROR] spatiotemporal computation failed on {trial_name}: {e}")
+            continue
+
+        # annotate both mean and std tables
+        for df_tab, collector in ((mean_df, mean_results),
+                                  (std_df,  std_results)):
+            df_copy = df_tab.copy()
+            df_copy['patient_id'] = patient_id
+            df_copy['trial']      = trial_name
+            collector.append(df_copy)
+
+    # Combine and save mean
+    if mean_results:
+        final_mean = pd.concat(mean_results, ignore_index=True)
+        mean_path = os.path.join(output_folder, f"{patient_id}_spatiotemporal_mean.csv")
+        if os.path.exists(mean_path): os.remove(mean_path)
+        final_mean.to_csv(mean_path, index=False)
+        if verbose: print(f"[INFO] Saved mean summary: {mean_path}")
+
+    # Combine and save std
+    if std_results:
+        final_std = pd.concat(std_results, ignore_index=True)
+        std_path = os.path.join(output_folder, f"{patient_id}_spatiotemporal_std.csv")
+        if os.path.exists(std_path): os.remove(std_path)
+        final_std.to_csv(std_path, index=False)
+        if verbose: print(f"[INFO] Saved std summary: {std_path}")
+
+    if not mean_results and not std_results and verbose:
+        print(f"[WARN] No spatiotemporal data for patient {patient_id}")
