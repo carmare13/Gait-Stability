@@ -4,10 +4,17 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 from dtaidistance import dtw
+from dtaidistance.dtw import distance_matrix
 from scipy.signal import decimate
 from Data_loader    import base_folders, list_patient_ids, iter_trial_paths, load_patient_data
 from pipeline import segment_downsamp
+from downsample import downsample_df
 from summary_utils  import ensure_dir
+
+#Choose dtw_fabio for the complete distance matrices for advanced post‐analysis
+#Choose dtw_di for summary statistics per trial and tidy tabular result
+#Choose dtw_di2 for the complete distance matrices
+#  for advanced post‐analysis faster than dtw_fabio and dtw_di
 
 
 def dtw_fabio(group_code,
@@ -160,9 +167,9 @@ def dtw_di(group_code,
 
     df_results = pd.DataFrame.from_records(records)
     df_results = df_results[['patient_id','trial_id','n_cycles','n_pairs','mean','median','std']]
-    csv_path = os.path.join(output_base, 'dtw_intra_trial_stats.csv')
+    csv_path = os.path.join(output_base, f'dtw_intra_trial_stats_{group_code}.csv')
     df_results.to_csv(csv_path, index=False)
-    json_path = os.path.join(output_base, 'dtw_intra_trial_stats.json')
+    json_path = os.path.join(output_base, f'dtw_intra_trial_stats_{group_code}.json')
     with open(json_path, 'w') as f:
         json.dump(records, f, indent=2)
     if verbose:
@@ -170,5 +177,200 @@ def dtw_di(group_code,
         print(df_results.head())
     return df_results
 
-#Choose dtw_fabio for the complete distance matrices for advanced post‐analysis
-#Choose dtw_di for summary statistics per trial and tidy tabular result
+def dtw_di2(group_code,
+            signal_col        = 'Ankle Dorsiflexion RT (deg)',
+            min_length        = 20,
+            downsample_factor = 4,
+            output_base       = 'DTW',
+            verbose           = False):
+    """
+        Same as dtw_di but uses distance_matrix_fast for faster pairwise DTW.
+        Computes pairwise DTW for each cycle-pair within each trial.
+    """
+
+    base_folder = base_folders[group_code]
+    ensure_dir(output_base)
+
+    dtw_all = {}
+    records = []
+
+    for pid in tqdm(list_patient_ids(base_folder), desc="Patients"):
+        dtw_all[pid] = {}
+        patient_folder = os.path.join(base_folder, pid)
+        dfs, paths = load_patient_data(patient_folder, pid, group_code, subfolder=None)
+        if not dfs or not paths:
+            if verbose:
+                print(f"[WARN] No data for {pid}")
+            continue
+
+        for df_trial, filepath in zip(dfs, paths):
+            trial_id = os.path.basename(filepath).replace('.csv','')
+
+            # Segment and downsample the selected signal
+            cycles = segment_downsamp(
+                df_trial,
+                signal_col=signal_col,
+                min_length=min_length,
+                downsample_factor=downsample_factor
+            )
+            n_cycles = len(cycles)
+
+            if n_cycles > 1:
+                try:  
+                # 
+                    D = dtw.distance_matrix_fast(cycles)
+                except Exception as e:
+                    print(f"[WARN] Fast DTW failed for {trial_id}: {e}. Trying slow version.")
+                    D = dtw.distance_matrix(cycles, parallel=True)    
+                # Upper triangle, k=1 to avoid self-distance
+                triu_indices = np.triu_indices(n_cycles, k=1)
+                dists = D[triu_indices]
+                stats = {
+                    'mean':   float(np.mean(dists)),
+                    'median': float(np.median(dists)),
+                    'std':    float(np.std(dists)),
+                    'n_pairs': int(len(dists))
+                }
+            else:
+                stats = {'mean': np.nan, 'median': np.nan, 'std': np.nan, 'n_pairs': 0}
+
+            dtw_all[pid][trial_id] = stats
+            records.append({
+                'patient_id': pid,
+                'trial_id':   trial_id,
+                'n_cycles':   n_cycles,
+                **stats
+            })
+
+            if verbose:
+                print(f"[INFO] {pid} {trial_id}: cycles={n_cycles}, stats={stats}")
+
+    # Save nested dict
+    out_json_all = os.path.join(output_base, 'dtw_all_cdist.json')
+    with open(out_json_all, 'w') as f:
+        json.dump(dtw_all, f)
+
+    df_results = pd.DataFrame.from_records(records)
+    df_results = df_results[['patient_id','trial_id','n_cycles','n_pairs','mean','median','std']]
+    csv_path = os.path.join(output_base, f'dtw_intra_trial_stats_cdist_{group_code}.csv')
+    df_results.to_csv(csv_path, index=False)
+    json_path = os.path.join(output_base, f'dtw_intra_trial_stats_cdist_{group_code}.json')
+    with open(json_path, 'w') as f:
+        json.dump(records, f, indent=2)
+    if verbose:
+        print(f"[OK] Nested DTW results → {out_json_all}")
+        print(df_results.head())
+    return df_results
+
+def dtw_not_segmented(
+    group_code,
+    signal_col='Ankle Dorsiflexion RT (deg)',
+    downsample_factor=4,
+    output_base='DTW',
+    verbose=False
+):
+    """
+    Compute pairwise DTW distances between entire trials (not segmented) for each patient,
+    using downsample.py's downsample function and dtw.distance_matrix_fast.
+    
+    Saves results in JSON (nested dict) and CSV (flat table).
+    
+    Returns:
+        dtw_all: dict { patient_id: { (trial_i, trial_j): distance } }
+    """
+    
+    base_folder = base_folders[group_code]
+    ensure_dir(output_base)
+
+    dtw_all = {}
+    records = []
+
+    for pid in tqdm(list_patient_ids(base_folder), desc="Patients"):
+        dtw_all[pid] = {}
+
+        dfs, paths = load_patient_data(os.path.join(base_folder, pid), pid, group_code, subfolder=None)
+        if not dfs or not paths:
+            if verbose:
+                print(f"[WARN] No data for {pid}")
+            continue
+
+        signals = []
+        trial_ids = []
+
+        for df, path in zip(dfs, paths):
+            trial_id = os.path.basename(path).replace('.csv', '')
+            if signal_col not in df.columns:
+                if verbose:
+                    print(f"[WARN] Signal {signal_col} not found in {trial_id}")
+                continue
+            try:
+                sig = df[signal_col].values.astype(float)
+            except Exception as e:
+                if verbose:
+                    print(f"[WARN] Error loading signal {signal_col} from {trial_id}: {e}")
+                continue
+            
+            # Use your downsample function here
+            if downsample_factor > 1:
+                sig = downsample_df(sig, rate=downsample_factor)
+
+            sig = np.asarray(sig).flatten()
+            if sig.size == 0:
+                if verbose:
+                    print(f"[WARN] Empty signal after downsampling in {trial_id}")
+                continue
+
+
+            signals.append(sig)
+
+            trial_ids.append(trial_id)
+
+        n_trials = len(signals)
+        if n_trials < 2:
+            if verbose:
+                print(f"[INFO] Not enough trials for patient {pid} to compute DTW")
+            continue
+
+        # Compute pairwise DTW distance matrix for all full trials
+        try:
+            D = dtw.distance_matrix_fast(signals)
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] Fast DTW failed for patient {pid}: {e}. Falling back to slow DTW.")
+            D = dtw.distance_matrix(signals, parallel=True)
+
+        # Extract upper triangle indices (i<j)
+        triu_indices = np.triu_indices(n_trials, k=1)
+        for i, j in zip(*triu_indices):
+            dist = float(D[i, j])
+            dtw_all[pid][f"{trial_ids[i]}_{trial_ids[j]}"] = dist
+
+            records.append({
+                'patient_id': pid,
+                'trial_i': trial_ids[i],
+                'trial_j': trial_ids[j],
+                'dtw_distance': dist
+            })
+
+            #if verbose:
+                #print(f"[INFO] {pid} {trial_ids[i]} vs {trial_ids[j]}: DTW={dist:.3f}")
+
+    # Save nested dict JSON
+    out_json_path = os.path.join(output_base, f'dtw_not_segmented_{group_code}.json')
+    with open(out_json_path, 'w') as f_json:
+        json.dump(dtw_all, f_json)
+
+    # Save flat CSV
+    df_records = pd.DataFrame.from_records(records) 
+    out_csv_path = os.path.join(output_base, f'dtw_not_segmented_{group_code}.csv')
+    df_records.to_csv(out_csv_path, index=False)
+
+    if verbose:
+        print(f"[OK] Saved DTW results JSON to {out_json_path}")
+        print(f"[OK] Saved DTW results CSV to {out_csv_path}")
+
+    return dtw_all
+
+
+
+

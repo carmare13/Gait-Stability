@@ -10,9 +10,10 @@ blocks = ["B01", "B02", "B03"]
 trials = ["T01", "T02", "T03"]
 
 # mapping of group code to its base folder
+project_root = os.path.dirname(os.path.abspath(__file__))
 base_folders = {
-    "G01": os.path.join(".", "young adults (19–35 years old)"),
-    "G03": os.path.join(".", "old adults (56+ years old)")
+    "G01": os.path.join(project_root, "young adults (19–35 years old)"),
+    "G03": os.path.join(project_root, "old adults (56+ years old)")
 }
 
 # root folder for all EDA outputs (keep uppercase)

@@ -59,7 +59,14 @@ def process_group_downsample(group_code, downsample_rate, cols=None, verbose=Fal
 def segment_downsamp(df,
                    signal_col='Ankle Dorsiflexion RT (deg)',
                    min_length=20,
-                   downsample_factor=4):
+                   downsample_factor=4,
+                   print_length=False
+                   ):
+    """
+        Segment a downsampled DataFrame into gait cycles.
+        Normalizes using z-score
+        Optionally prints the length of each cycle.
+    """
     hs_R, _, _, _ = gait_events_HC_JA(df)
     if len(hs_R) < 2:
         return []
@@ -70,6 +77,8 @@ def segment_downsamp(df,
         cycle = series[start:end]
         if len(cycle) >= min_length:
             if len(cycle) > 27:
+                if print_length:
+                    print(f"Cycle length: {len(cycle)}")
                 cycle = (cycle - np.mean(cycle)) / np.std(cycle)
                 cycle = decimate(cycle, downsample_factor, zero_phase=True)
                 cycles.append(cycle)

@@ -1,5 +1,6 @@
 
 import pandas as pd
+import numpy as np
 from scipy.signal import decimate
 
 def downsample_df(df, rate, cols=None, zero_phase=True):
@@ -16,15 +17,12 @@ def downsample_df(df, rate, cols=None, zero_phase=True):
     Returns:
         pd.DataFrame: downsampled DataFrame, with the same index (kept) or reset.
     """
-    # decide which columns
+    if isinstance(df, np.ndarray):
+        df = pd.DataFrame(df, columns=cols)
+
     to_ds = cols if cols is not None else df.columns.tolist()
-    
-    # preallocate result
-    out = {}
-    for c in to_ds:
-        # use scipy.signal.decimate which applies an anti-alias filter
-        # `ftype='iir'` uses an IIR filter; set zero_phase=False to use lfilter
-        out[c] = decimate(df[c].values, rate, ftype='iir', zero_phase=zero_phase)
+        
+    out = {c: decimate(df[c].values, rate, ftype='iir', zero_phase=zero_phase) for c in to_ds}
     
     # build new DataFrame; index will be compressed accordingly
     # if your index is numeric time and you want to keep it, you can do:
@@ -37,8 +35,10 @@ def downsample_df(df, rate, cols=None, zero_phase=True):
     
     # if there are other columns you didn’t downsample, copy them via slicing
     if cols is not None and set(cols) != set(df.columns):
-        for c in df.columns.difference(cols):
-            result[c] = df[c].iloc[::rate].values
+        extra_cols = df.columns.difference(cols)
+        extras = df.loc[:, extra_cols].iloc[::rate].reset_index(drop=True)
+        extras.index = result.index  
+        result = pd.concat([result, extras], axis=1)
     
     return result
 
