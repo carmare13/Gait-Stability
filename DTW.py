@@ -13,9 +13,9 @@ from summary_utils  import ensure_dir
 
 #Choose dtw_fabio for the complete distance matrices for advanced post‐analysis
 #Choose dtw_di for summary statistics per trial and tidy tabular result
-#Choose dtw_di2 for the complete distance matrices
-#  for advanced post‐analysis faster than dtw_fabio and dtw_di
-
+#Choose dtw_di2 for the complete distance matrices for advanced post‐analysis faster than dtw_fabio and dtw_di
+#Choose dtw_not_segmented for pairwise DTW on full trials without segmentation
+#Choose dtw_ns_normalized for pairwise DTW on full trials without segmentation, but normalized (z-score) 
 
 def dtw_fabio(group_code,
               source='downsampled',
@@ -206,9 +206,21 @@ def dtw_di2(group_code,
         for df_trial, filepath in zip(dfs, paths):
             trial_id = os.path.basename(filepath).replace('.csv','')
 
+            signal = df_trial[signal_col].values
+            mean_signal = np.mean(signal)
+            std_signal = np.std(signal)
+            if std_signal == 0:
+                normalized_signal = signal - mean_signal  # evitar división por cero
+            else:
+                normalized_signal = (signal - mean_signal) / std_signal
+
+    # Crear un nuevo DataFrame temporal con la señal normalizada
+            df_trial_norm = df_trial.copy()
+            df_trial_norm[signal_col] = normalized_signal   
+
             # Segment and downsample the selected signal
             cycles = segment_downsamp(
-                df_trial,
+                df_trial_norm,
                 signal_col=signal_col,
                 min_length=min_length,
                 downsample_factor=downsample_factor
@@ -310,7 +322,7 @@ def dtw_not_segmented(
                     print(f"[WARN] Error loading signal {signal_col} from {trial_id}: {e}")
                 continue
             
-            # Use your downsample function here
+            # Downsample the signal if needed
             if downsample_factor > 1:
                 sig = downsample_df(sig, rate=downsample_factor)
 
@@ -371,6 +383,131 @@ def dtw_not_segmented(
 
     return dtw_all
 
+def dtw_ns_normalized(
+    group_code,
+    signal_col='Ankle Dorsiflexion RT (deg)',
+    downsample_factor=4,
+    output_base='DTW',
+    verbose=False
+):
+    """
+    Compute pairwise DTW distances between entire trials (not segmented) for each patient,
+    after normalizing (z-score) each trial's signal.
+    Uses downsample_df for downsampling and dtw.distance_matrix_fast with fallback.
+    
+    Saves results in JSON (nested dict) and CSV (flat table).
+    
+    Returns:
+        dtw_all: dict { patient_id: { "trial_i_trial_j": distance } }
+    """
+
+    base_folder = base_folders[group_code]
+    ensure_dir(output_base)
+
+    dtw_all = {}
+    records = []
+
+    for pid in tqdm(list_patient_ids(base_folder), desc="Patients"):
+        dtw_all[pid] = {}
+
+        dfs, paths = load_patient_data(os.path.join(base_folder, pid), pid, group_code, subfolder=None)
+        if not dfs or not paths:
+            if verbose:
+                print(f"[WARN] No data for {pid}")
+            continue
+
+        signals = []
+        trial_ids = []
+
+        for df, path in zip(dfs, paths):
+            trial_id = os.path.basename(path).replace('.csv', '')
+            if signal_col not in df.columns:
+                if verbose:
+                    print(f"[WARN] Signal {signal_col} not found in {trial_id}")
+                continue
+            try:
+                sig = df[signal_col].values
+                sig = np.asarray(sig)
+                if sig.ndim > 1:
+                    sig = sig.flatten()
+                sig = sig.astype(float)
+            except Exception as e:
+                if verbose:
+                    print(f"[WARN] Error loading signal {signal_col} from {trial_id}: {e}")
+                continue
+
+            # Downsample the signal if needed
+            if downsample_factor > 1:
+                sig = downsample_df(sig, rate=downsample_factor)
+                
+
+            # Normalize with z-score
+            sig = np.asarray(sig)
+            if sig.ndim > 1:
+                sig = sig.flatten()
+
+            sig_mean = np.mean(sig)
+            sig_std = np.std(sig)
+
+            if sig_std > 0:
+                sig = (sig - sig_mean) / sig_std
+            else:
+                sig = sig - sig_mean
+
+            
+            if sig.size == 0:
+                if verbose:
+                    print(f"[WARN] Empty signal after downsampling in {trial_id}")
+                continue
+
+            signals.append(sig)
+            trial_ids.append(trial_id)
+
+        n_trials = len(signals)
+        if n_trials < 2:
+            if verbose:
+                print(f"[INFO] Not enough trials for patient {pid} to compute DTW")
+            continue
+
+        # Compute pairwise DTW distance matrix for all full trials
+        try:
+            D = dtw.distance_matrix_fast(signals)
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] Fast DTW failed for patient {pid}: {e}. Falling back to slow DTW.")
+            D = dtw.distance_matrix(signals, parallel=True)
+
+        # Extract upper triangle indices (i<j)
+        triu_indices = np.triu_indices(n_trials, k=1)
+        for i, j in zip(*triu_indices):
+            dist = float(D[i, j])
+            dtw_all[pid][f"{trial_ids[i]}_{trial_ids[j]}"] = dist
+
+            records.append({
+                'patient_id': pid,
+                'trial_i': trial_ids[i],
+                'trial_j': trial_ids[j],
+                'dtw_distance': dist
+            })
+
+            if verbose:
+                print(f"[INFO] {pid} {trial_ids[i]} vs {trial_ids[j]}: DTW={dist:.3f}")
+
+    # Save nested dict JSON
+    out_json_path = os.path.join(output_base, f'dtw_ns_normalized_{group_code}.json')
+    with open(out_json_path, 'w') as f_json:
+        json.dump(dtw_all, f_json)
+
+    # Save flat CSV
+    df_records = pd.DataFrame.from_records(records)
+    out_csv_path = os.path.join(output_base, f'dtw_ns_normalized_{group_code}.csv')
+    df_records.to_csv(out_csv_path, index=False)
+
+    if verbose:
+        print(f"[OK] Saved DTW normalized results JSON to {out_json_path}")
+        print(f"[OK] Saved DTW normalized results CSV to {out_csv_path}")
+
+    return dtw_all
 
 
 
