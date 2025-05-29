@@ -18,6 +18,71 @@ from downsample import downsample_df
 from scipy.signal import decimate
 from gait_events import gait_events_HC_JA
 
+# ─── Trim signal edges to avoid starting and ending noise ───────────────────────────────────────
+def trim_signal_edges(df, fs, trim_seconds):
+    """
+    Trim the first and last trim_seconds from the signal.
+    
+    Args:
+        df: pandas DataFrame containing the signal data.
+        fs: sampling frequency in Hz.
+        trim_seconds: number of seconds to trim from start and end.
+        
+    Returns:
+        Trimmed pandas DataFrame.
+    """
+    n_trim = int(trim_seconds * fs)
+    
+    if len(df) <= 2 * n_trim:
+        # Signal too short to trim, return empty DataFrame
+        return pd.DataFrame(columns=df.columns)
+    
+    # Trim rows: skip first n_trim and last n_trim samples
+    df_trimmed = df.iloc[n_trim:-n_trim].reset_index(drop=True)
+    return df_trimmed
+
+def process_group_trim(group_code, fs, trim_seconds, verbose=False):
+    """
+    For each trial CSV in the group:
+    1) Load the raw CSV via pandas
+    2) Trim edges of the signal
+    3) Save to <base>/<patient_id>/trimmed/<trial>.csv
+    """
+    base = base_folders[group_code]
+    
+    for pid in tqdm(list_patient_ids(base), desc=f"Trimming group {group_code}", unit="patient"):
+        patient_src = os.path.join(base, pid)
+        patient_out = os.path.join(base,pid, "trimmed")
+        ensure_dir(patient_out)
+
+        for day, block, trial, path in iter_trial_paths(patient_src, pid, group_code):
+            if not os.path.isfile(path):
+                if verbose:
+                    print(f"  [WARN] Missing file: {path}")
+                continue
+
+            try:
+                # Load raw trial data
+                df_raw = pd.read_csv(path)
+                
+                # Trim the edges
+                df_trimmed = trim_signal_edges(df_raw, fs, trim_seconds=trim_seconds)
+                
+                if df_trimmed.empty:
+                    if verbose:
+                        print(f"  [WARN] Trimmed empty data for file: {path}")
+                    continue
+                
+                # Save trimmed file
+                fname = f"{pid}_{group_code}_{day}_{block}_{trial}.csv"
+                out_path = os.path.join(patient_out, fname)
+                df_trimmed.to_csv(out_path, index=False)
+                
+                if verbose:
+                    print(f"  [OK] {fname}")
+            except Exception as e:
+                print(f"  [ERROR] processing {path}: {e}")
+
 # ─── Downsample ─────────────────────────────────────────────────
 def process_group_downsample(group_code, downsample_rate, cols=None, verbose=False):
     """
