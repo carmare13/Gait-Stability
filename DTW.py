@@ -7,13 +7,14 @@ from dtaidistance import dtw
 from dtaidistance.dtw import distance_matrix
 from scipy.signal import decimate
 from Data_loader    import base_folders, list_patient_ids, iter_trial_paths, load_patient_data
+from segment_utils import segment_cycles_simple
 from pipeline import segment_downsamp
 from downsample import downsample_df
 from summary_utils  import ensure_dir
 
 #Choose dtw_fabio for the complete distance matrices for advanced post‐analysis
 #Choose dtw_di for summary statistics per trial and tidy tabular result
-#Choose dtw_di2 for the complete distance matrices for advanced post‐analysis faster than dtw_fabio and dtw_di
+#Choose dtw_di2 for the complete distance matrices on the segmented without normalization or downsampling
 #Choose dtw_not_segmented for pairwise DTW on full trials without segmentation
 #Choose dtw_ns_normalized for pairwise DTW on full trials without segmentation, but normalized (z-score) 
 
@@ -179,15 +180,14 @@ def dtw_di(group_code,
 
 def dtw_di2(group_code,
             signal_col        = 'Ankle Dorsiflexion RT (deg)',
-            min_length        = 20,
-            downsample_factor = 4,
             output_base       = 'DTW',
             verbose           = False):
     """
-        Same as dtw_di but uses distance_matrix_fast for faster pairwise DTW.
-        Computes pairwise DTW for each cycle-pair within each trial.
+        Computes pairwise DTW for each cycle-pair within each trial,
+        without normalizing the signal.
+        Uses all dataframe columns for segmentation but only the specified
+        column for DTW calculation.
     """
-
     base_folder = base_folders[group_code]
     ensure_dir(output_base)
 
@@ -196,45 +196,35 @@ def dtw_di2(group_code,
 
     for pid in tqdm(list_patient_ids(base_folder), desc="Patients"):
         dtw_all[pid] = {}
-        patient_folder = os.path.join(base_folder, pid)
+        patient_folder = os.path.join(base_folder, pid, "trimmed")
         dfs, paths = load_patient_data(patient_folder, pid, group_code, subfolder=None)
         if not dfs or not paths:
             if verbose:
-                print(f"[WARN] No data for {pid}")
+                print(f"[WARN] No data para paciente {pid}")
             continue
 
         for df_trial, filepath in zip(dfs, paths):
             trial_id = os.path.basename(filepath).replace('.csv','')
-
-            signal = df_trial[signal_col].values
-            mean_signal = np.mean(signal)
-            std_signal = np.std(signal)
-            if std_signal == 0:
-                normalized_signal = signal - mean_signal  # evitar división por cero
-            else:
-                normalized_signal = (signal - mean_signal) / std_signal
-
-    # Crear un nuevo DataFrame temporal con la señal normalizada
-            df_trial_norm = df_trial.copy()
-            df_trial_norm[signal_col] = normalized_signal   
-
-            # Segment and downsample the selected signal
-            cycles = segment_downsamp(
-                df_trial_norm,
-                signal_col=signal_col,
-                min_length=min_length,
-                downsample_factor=downsample_factor
+            ciclos_df = segment_cycles_simple(
+                df_trial,
+                print_cycle_length=False
             )
-            n_cycles = len(cycles)
-
+            n_cycles = len(ciclos_df)
+            if n_cycles > 0:
+                ciclos_signal = [
+                    ciclo_df[signal_col].values
+                    for ciclo_df in ciclos_df
+                ]
+            else:
+                ciclos_signal = []
             if n_cycles > 1:
-                try:  
-                # 
-                    D = dtw.distance_matrix_fast(cycles)
+                try:
+                    D = dtw.distance_matrix_fast(ciclos_signal)
                 except Exception as e:
-                    print(f"[WARN] Fast DTW failed for {trial_id}: {e}. Trying slow version.")
-                    D = dtw.distance_matrix(cycles, parallel=True)    
-                # Upper triangle, k=1 to avoid self-distance
+                    if verbose:
+                        print(f"[WARN] Fast DTW falló para {trial_id}: {e}. Usando versión lenta.")
+                    D = dtw.distance_matrix(ciclos_signal, parallel=True)
+
                 triu_indices = np.triu_indices(n_cycles, k=1)
                 dists = D[triu_indices]
                 stats = {
@@ -255,9 +245,8 @@ def dtw_di2(group_code,
             })
 
             if verbose:
-                print(f"[INFO] {pid} {trial_id}: cycles={n_cycles}, stats={stats}")
+                print(f"[INFO] {pid} {trial_id}: ciclos={n_cycles}, stats={stats}")
 
-    # Save nested dict
     out_json_all = os.path.join(output_base, 'dtw_all_cdist.json')
     with open(out_json_all, 'w') as f:
         json.dump(dtw_all, f)
@@ -269,22 +258,21 @@ def dtw_di2(group_code,
     json_path = os.path.join(output_base, f'dtw_intra_trial_stats_cdist_{group_code}.json')
     with open(json_path, 'w') as f:
         json.dump(records, f, indent=2)
+
     if verbose:
         print(f"[OK] Nested DTW results → {out_json_all}")
         print(df_results.head())
+
     return df_results
 
 def dtw_not_segmented(
     group_code,
     signal_col='Ankle Dorsiflexion RT (deg)',
-    downsample_factor=4,
     output_base='DTW',
     verbose=False
 ):
     """
-    Compute pairwise DTW distances between entire trials (not segmented) for each patient,
-    using downsample.py's downsample function and dtw.distance_matrix_fast.
-    
+    Compute pairwise DTW distances between entire trials (not segmented) for each patient    
     Saves results in JSON (nested dict) and CSV (flat table).
     
     Returns:
@@ -322,14 +310,11 @@ def dtw_not_segmented(
                     print(f"[WARN] Error loading signal {signal_col} from {trial_id}: {e}")
                 continue
             
-            # Downsample the signal if needed
-            if downsample_factor > 1:
-                sig = downsample_df(sig, rate=downsample_factor)
 
             sig = np.asarray(sig).flatten()
             if sig.size == 0:
                 if verbose:
-                    print(f"[WARN] Empty signal after downsampling in {trial_id}")
+                    print(f"[WARN] Empty signal in {trial_id}")
                 continue
 
 
@@ -386,15 +371,12 @@ def dtw_not_segmented(
 def dtw_ns_normalized(
     group_code,
     signal_col='Ankle Dorsiflexion RT (deg)',
-    downsample_factor=4,
     output_base='DTW',
     verbose=False
 ):
     """
     Compute pairwise DTW distances between entire trials (not segmented) for each patient,
-    after normalizing (z-score) each trial's signal.
-    Uses downsample_df for downsampling and dtw.distance_matrix_fast with fallback.
-    
+    after normalizing (z-score) each trial's signal.    
     Saves results in JSON (nested dict) and CSV (flat table).
     
     Returns:
@@ -435,11 +417,7 @@ def dtw_ns_normalized(
                 if verbose:
                     print(f"[WARN] Error loading signal {signal_col} from {trial_id}: {e}")
                 continue
-
-            # Downsample the signal if needed
-            if downsample_factor > 1:
-                sig = downsample_df(sig, rate=downsample_factor)
-                
+             
 
             # Normalize with z-score
             sig = np.asarray(sig)
@@ -457,7 +435,7 @@ def dtw_ns_normalized(
             
             if sig.size == 0:
                 if verbose:
-                    print(f"[WARN] Empty signal after downsampling in {trial_id}")
+                    print(f"[WARN] Empty signal {trial_id}")
                 continue
 
             signals.append(sig)

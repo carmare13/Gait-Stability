@@ -66,9 +66,11 @@ def gait_events_HC_JA(df):
             max_peak = max(cycle_peaks, key=lambda p: knee_vel_L[p])
             if hip_acc_L[max_peak] > 0:
                 toe_off_L.append(max_peak)
-
+    print("Heel Strikes (Right):", heel_strike_R)
+    print("Heel Strikes (Left):", heel_strike_L) 
     # Return detected gait events
-    return heel_strike_R, heel_strike_L, toe_off_R, toe_off_L     
+    return heel_strike_R, heel_strike_L, toe_off_R, toe_off_L   
+     
 
 def normalize_signal(signal):
     return (signal - np.min(signal)) / (np.max(signal) - np.min(signal))
@@ -95,10 +97,6 @@ def gait_events_norm(df):
     # Detect Heel Strikes (HS) - Knee extension peaks
     heel_strike_R, _ = find_peaks(knee_flex_R, height=0)  # Right knee extension peak
     heel_strike_L, _ = find_peaks(knee_flex_L, height=0)  # Left knee extension peak
-
-    # Filter by hip flexion (only accept if hip is flexed beyond threshold)
-    #heel_strike_R = [i for i in heel_strike_R if hip_flex_R[i] > hip_flex_threshold]
-    #heel_strike_L = [i for i in heel_strike_L if hip_flex_L[i] > hip_flex_threshold]
 
     # Filter by Contact information (only consider if contact is made - contact == 1000)
     heel_strike_R = [i for i in heel_strike_R if contact_R[i] == 1000]
@@ -139,3 +137,33 @@ def gait_events_norm(df):
 
     # Return detected gait events
     return heel_strike_R, heel_strike_L, toe_off_R, toe_off_L     
+
+
+def gait_events_simple(df):
+    """
+    Detecta Heel Strikes (HS) y Toe‐Offs (TO) basándose únicamente en las transiciones
+    de los canales de contacto ("Contact RT" y "Contact LT").
+
+    Asume que en df["Contact RT"] y df["Contact LT"]:
+      - 0  = pie en el aire
+      - 1000 = pie en apoyo
+
+    Retorna cuatro listas de índices (enteros):
+      hs_R: índices donde ocurre Heel‐Strike derecho
+      hs_L: índices donde ocurre Heel‐Strike izquierdo
+      to_R: índices donde ocurre Toe‐Off derecho
+      to_L: índices donde ocurre Toe‐Off izquierdo
+    """
+    
+    contact_R = df["Contact RT"].values > 0
+    contact_L = df["Contact LT"].values > 0
+
+    heel_strike_R = np.where((~contact_R[:-1]) & (contact_R[1:]))[0] + 1
+    heel_strike_L = np.where((~contact_L[:-1]) & (contact_L[1:]))[0] + 1
+
+    toe_off_R = np.where((contact_R[:-1]) & (~contact_R[1:]))[0] + 1
+    toe_off_L = np.where((contact_L[:-1]) & (~contact_L[1:]))[0] + 1
+    print("Heel Strikes (Right):", len(heel_strike_R))
+    print("Heel Strikes (Left):", len(heel_strike_L)) 
+
+    return heel_strike_R.tolist(), heel_strike_L.tolist(), toe_off_R.tolist(), toe_off_L.tolist()
