@@ -163,7 +163,7 @@ def gait_events_simple(df):
 
     toe_off_R = np.where((contact_R[:-1]) & (~contact_R[1:]))[0] + 1
     toe_off_L = np.where((contact_L[:-1]) & (~contact_L[1:]))[0] + 1
-    print("Heel Strikes (Right):", len(heel_strike_R))
-    print("Heel Strikes (Left):", len(heel_strike_L)) 
+    #print("Heel Strikes (Right):", len(heel_strike_R))
+    #print("Heel Strikes (Left):", len(heel_strike_L)) 
 
     return heel_strike_R.tolist(), heel_strike_L.tolist(), toe_off_R.tolist(), toe_off_L.tolist()

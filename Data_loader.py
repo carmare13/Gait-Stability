@@ -10,7 +10,8 @@ blocks = ["B01", "B02", "B03"]
 trials = ["T01", "T02", "T03"]
 
 # mapping of group code to its base folder
-project_root = os.path.dirname(os.path.abspath(__file__))
+#project_root = os.path.dirname(os.path.abspath(__file__))
+project_root = "/mnt/storage/dmartinez" #Now the database is in the server
 base_folders = {
     "G01": os.path.join(project_root, "young adults (19–35 years old)"),
     "G03": os.path.join(project_root, "old adults (56+ years old)")

@@ -27,7 +27,6 @@ def segment_cycles(df,print_cycle_length=False):
         cycles.append(cycle)
     return cycles
 
-
 def segment_cycles_norm(df,print_cycle_length=False):
     """
     Slice a DataFrame into gait cycles based on successive right-heel strikes.
@@ -54,11 +53,10 @@ def segment_cycles_norm(df,print_cycle_length=False):
         cycles.append(cycle)
     return cycles
 
-
-
 def segment_cycles_simple(df,print_cycle_length=False):
     """
     Slice a DataFrame into gait cycles based on successive right-heel strikes.
+    One gait cycle is defined as the time between two successive right-heel strikes.
     Uses a queue to store the cycles
 
     Args:
