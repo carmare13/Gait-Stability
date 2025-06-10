@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 from itertools import product
+import json
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -97,6 +98,7 @@ def load_patient_data(patient_folder, patient_id, group_code, subfolder=None, ve
 
 
 def summarize_file(path, usecols=None, dtype=None):
+
     """
     Read a single CSV at `path`, compute descriptive stats and count missing values.
     Returns a DataFrame with the transpose of describe() and a 'n_missing' column.
@@ -105,3 +107,45 @@ def summarize_file(path, usecols=None, dtype=None):
     summary = df.describe().transpose()
     summary['n_missing'] = df.isna().sum()
     return summary
+
+# ─── AE  ─────────────────────────────────────────────────────────────
+def load_subjects_from_json(json_path):
+    """
+    Reads a JSON file containing a dictionary of subjects and returns a list of their IDs.
+    Expected format: { "S001": {...}, "S002": {...}, … }
+    """
+    with open(json_path, 'r') as f:
+        subjects = json.load(f)
+    return list(subjects.keys())
+
+
+def iter_trial_paths_npy(patient_folder,
+                         patient_id,
+                         preprocessed_subfolder="preprocessed"):
+    """
+    Generates full paths to .npy files for a given patient:
+      (day, block, trial, full_path)
+    Uses the global variables days, blocks, trials.
+    """
+    for day, block, trial in product(days, blocks, trials):
+        filename = f"{patient_id}_{day}_{block}_{trial}_preprocessed.npy"
+        yield day, block, trial, os.path.join(patient_folder, preprocessed_subfolder, filename)
+
+
+def get_all_npy_paths_by_group(subjects_dict, base_folders_map):
+    """
+    For each group in subjects_dict (e.g., "G01": [id1, id2, …]),
+    constructs patient_folder = base_folders_map[group] + patient_id,
+    iterates through trial .npy paths, and accumulates only the existing ones.
+    """
+    paths = []
+    for group_code, subject_list in subjects_dict.items():
+        base_folder = base_folders_map[group_code]
+        for patient_id in subject_list:
+            patient_folder = os.path.join(base_folder, patient_id)
+            for day, block, trial, full_path in iter_trial_paths_npy(patient_folder, patient_id):
+                if os.path.exists(full_path):
+                    paths.append(full_path)
+                else:
+                    print(f"Warning: missing file {full_path}")
+    return paths
