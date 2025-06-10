@@ -10,6 +10,7 @@
 # Ignorar carpeta de librería local
 NONAN_Library_main/
 prueba.ipynb
-
+saved_models
+logs
 
 __pycache__/
