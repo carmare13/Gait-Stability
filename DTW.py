@@ -8,7 +8,7 @@ from dtaidistance.dtw import distance_matrix
 from scipy.signal import decimate
 from Data_loader    import base_folders, list_patient_ids, iter_trial_paths, load_patient_data
 from segment_utils import segment_cycles_simple
-from pipeline import segment_downsamp
+from PP_pipeline import segment_downsamp
 from downsample import downsample_df
 from summary_utils  import ensure_dir
 
