@@ -2,6 +2,7 @@ import os
 import pandas as pd
 from itertools import product
 import json
+from typing import Optional
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -44,7 +45,6 @@ def list_patient_ids(base_folder):
 
 
 # ─── Data Loading ─────────────────────────────────────────────────────────────
-
 def iter_trial_paths(patient_folder, patient_id, group_code):
     """
     Yield one trial at a time as (day, block, trial, full_path).
@@ -54,46 +54,62 @@ def iter_trial_paths(patient_folder, patient_id, group_code):
         fname = f"{patient_id}_{group_code}_{d}_{b}_{t}.csv"
         yield d, b, t, os.path.join(patient_folder, fname)
 
+def load_and_clean_csv(path: str) -> Optional[pd.DataFrame]:
+    df = pd.read_csv(path)
+    df.interpolate(method='linear', axis=0, limit_direction='both', inplace=True)
+    df.ffill(axis=0, inplace=True)
+    df.bfill(axis=0, inplace=True)
+    if df.isna().any().any():
+        print(f"[SKIP] Discarded trial {os.path.basename(path)} due to remaining NaNs")
+        return None
+    return df
 
-def load_patient_data(patient_folder, patient_id, group_code, subfolder=None, verbose=False):
+
+def load_patient_data(
+    patient_folder: str,
+    patient_id: str,
+    group_code: str,
+    subfolder: str | None = None,
+    verbose: bool = False
+) -> tuple[list[pd.DataFrame], list[str]]:
     """
-    Read all available trial CSVs for one patient into a single DataFrame.
+    Read all available trial CSVs for one patient into a list of DataFrames.
     Adds metadata columns: patient_id, group, day, block, trial.
     Returns:
         dfs (list of DataFrames), paths (list of str)
     """
-    df_list = []
-    file_list = []
+    df_list: list[pd.DataFrame] = []
+    file_list: list[str]       = []
     
     for d, b, t, path in iter_trial_paths(patient_folder, patient_id, group_code):
-        #print(f"Accediendo a: {path}")
         if not os.path.isfile(path):
             if verbose:
                 print(f"  [WARN] file not found: {path}")
             continue
         
         try:
-            df = pd.read_csv(path, dtype=float)
-            #print(f"Trying to read{path}: shape={df.shape}")
-            if df.empty:
-                print(f"[WARN] empty file: {path}")
+            df = load_and_clean_csv(path)
+            if df is None:
                 continue
-            # Attach metadata...
+            if df.empty:
+                if verbose:
+                    print(f"[WARN] empty file: {path}")
+                continue
+
+            # Attach metadata
             df['patient_id'] = patient_id
             df['group']      = group_code
             df['day']        = d
             df['block']      = b
             df['trial']      = t
+
             df_list.append(df)
             file_list.append(path)
+
         except Exception as e:
             print(f"[ERROR] reading {path}: {e}")
 
-    
-    if df_list:
-        return df_list, file_list
-    else:
-        return [], [] # No data for this patient 
+    return (df_list, file_list) if df_list else ([], [])
 
 
 
@@ -120,11 +136,11 @@ def load_subjects_from_json(json_path):
 
 
 def iter_trial_paths_npy(patient_folder,
-                         patient_id,
-                         preprocessed_subfolder="preprocessed"):
+                        patient_id,
+                        preprocessed_subfolder="preprocessed"):
     """
     Generates full paths to .npy files for a given patient:
-      (day, block, trial, full_path)
+    (day, block, trial, full_path)
     Uses the global variables days, blocks, trials.
     """
     for day, block, trial in product(days, blocks, trials):

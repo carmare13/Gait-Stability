@@ -19,6 +19,7 @@ from Data_loader  import (
     list_patient_ids,
     iter_trial_paths,
     load_patient_data,
+    load_and_clean_csv,
     summarize_file
 )
 from SpatioTemporal_calculation import process_spatiotemporal_for_patient
@@ -610,18 +611,25 @@ def set_scaler(
         num_kinematic_var: int,
         scaler_type: str = "standard",
         scaler_filename: str = "global_kinematic_scaler.pkl",
+        checkpoint_every: int = 5,
+        load_checkpoint: bool = False
     ):
     """
-    This script builds a single global scaler to normalize all kinematic features 
-    Locates and loads that patient’s preprocessed (“trimmed”) trial data.
-    Applies a temporal normalization routine (temporal_normalization_GC)
-    Flattens the resulting 3D tensor into a 2D array and incrementally fits a StandardScaler 
-    Once all patients have been processed, the scaler has learned the global
-    mean and standard deviation for every kinematic variable. The script then:
-    Verifies that the scaler was successfully fitted,
-    Saves the trained scaler and
-    Prints out the first few entries of the learned means and standard deviations for sanity checking.
+    Build and save a global scaler for kinematic data, with checkpointing support.
+
+    Args:
+        training_patient_ids: List of patient IDs to use for fitting.
+        target_length: Number of timesteps to normalize each cycle to.
+        num_kinematic_var: Number of kinematic variables (columns) in the dataset.
+        scaler_type: "standard" or "minmax".
+        scaler_filename: Name of file to save final scaler.
+        checkpoint_every: Frequency (in patients) to save scaler checkpoint.
+        load_checkpoint: Whether to resume from an existing checkpoint.
     """
+
+    checkpoint_file = scaler_filename.replace(".pkl", "_checkpoint.pkl")
+
+    # Select scaler
     scaler_type = scaler_type.lower()
     if scaler_type == "standard":
         scaler = StandardScaler()
@@ -630,8 +638,16 @@ def set_scaler(
     else:
         raise ValueError("scaler_type must be 'standard' or 'minmax'.")
 
-    # Progress bar over patients
-    for patient_id in tqdm(training_patient_ids, desc="Patients", unit="pt"):
+    # Optionally load checkpoint
+    start_index = 0
+    if load_checkpoint and os.path.exists(checkpoint_file):
+        scaler = load(checkpoint_file)
+        tqdm.write(f"[INFO] Loaded checkpoint from: {checkpoint_file}")
+        # Optional: track how many patients were already processed if desired
+        # For now, we assume the user adjusts training_patient_ids manually if needed
+
+    # Loop over patients
+    for idx, patient_id in enumerate(tqdm(training_patient_ids, desc="Patients", unit="pt")):
         found = False
 
         for group_code, base_folder in base_folders.items():
@@ -646,7 +662,6 @@ def set_scaler(
                 found = True
                 break
 
-            # Progress bar over this patient's trials
             for trial_df in tqdm(trials_list, desc=f"Trials {patient_id}", unit="tr", leave=False):
                 kinematic_df = trial_df.iloc[:, :num_kinematic_var]
                 normalized_cycles = temporal_normalization_GC(
@@ -666,17 +681,25 @@ def set_scaler(
         if not found:
             tqdm.write(f"[ERROR] Patient {patient_id} not found in any group.")
 
-    # Verify that the scaler was fitted
+        # Save checkpoint periodically
+        if (idx + 1) % checkpoint_every == 0:
+            dump(scaler, checkpoint_file)
+            tqdm.write(f"[CHECKPOINT] Saved checkpoint at patient {patient_id}")
+
+    # Final verification
     try:
-        _ = scaler.mean_
+        if isinstance(scaler, StandardScaler):
+            _ = scaler.mean_
+        elif isinstance(scaler, MinMaxScaler):
+            _ = scaler.data_min_
     except AttributeError:
         raise ValueError("No data processed: scaler was not fitted.")
 
-    # Save the fitted scaler
+    # Save final scaler
     dump(scaler, scaler_filename)
-    tqdm.write(f"Scaler saved to: {scaler_filename}")
+    tqdm.write(f"[INFO] Final scaler saved to: {scaler_filename}")
 
-    # Sanity-check: print first 5 statistics
+    # Show some stats
     if isinstance(scaler, StandardScaler):
         tqdm.write(f"Means (first 5): {scaler.mean_[:5]}")
         tqdm.write(f"Scales (first 5): {scaler.scale_[:5]}")
@@ -684,8 +707,7 @@ def set_scaler(
         tqdm.write(f"Data min (first 5): {scaler.data_min_[:5]}")
         tqdm.write(f"Data max (first 5): {scaler.data_max_[:5]}")
 
-    return scaler 
-
+    return scaler
 # ─── Dataset split  ─────────────────────────────────────────────────
 def split_subjects_by_cycle_count(subjects_dict, train_ratio=0.7,val_ratio=0.15, seed=42):
     """
@@ -759,12 +781,12 @@ def _encode_metadata_to_numeric(meta_dict: dict) -> np.ndarray:
     return np.array(numeric_values, dtype=int)
 
 def save_patient_preprocessed_tensors(pid: str,
-                                     group_code: str,
-                                     target_length: int,
-                                     num_kinematic_variables: int,
-                                     global_scaler,
-                                     subfolder_name: str = "preprocessed",
-                                     verbose: bool = True):
+                                    group_code: str,
+                                    target_length: int,
+                                    num_kinematic_variables: int,
+                                    global_scaler,
+                                    subfolder_name: str = "preprocessed",
+                                    verbose: bool = True):
     """
     Processes all trimmed trials for a patient:
     1. Temporally normalizes each cycle using temporal_normalization_GC.
@@ -800,10 +822,14 @@ def save_patient_preprocessed_tensors(pid: str,
                 print(f"  [WARN] Missing file: {filepath}")
             continue
 
-        df_trial = pd.read_csv(filepath, dtype=float)
+        df_trial = load_and_clean_csv(filepath)
         if df_trial.empty:
             if verbose:
-                print(f"  [WARN] Empty trial: {filepath}")
+                print(f"[SKIP] Raw trial discarded (NaNs) → {os.path.basename(filepath)}")
+            continue
+
+        if df_trial.isna().any().any():
+            print(f"[ERROR] ¡Todavía NaNs en {os.path.basename(filepath)}!") 
             continue
 
         # 1) Temporal normalization per cycle
@@ -840,37 +866,80 @@ def save_patient_preprocessed_tensors(pid: str,
         if verbose:
             print(f"  [OK] {fname} -> shape {final_tensor.shape}")
 
-def preprocess_all_groups_and_patients(target_length: int,
-                                       num_kinematic_variables: int,
-                                       global_scaler,
-                                       subfolder_name: str = "preprocessed",
-                                       verbose: bool = True):
+def clean_and_save_trial(input_path: str, eps: float = 1e-8) -> bool:
     """
-    Applies save_patient_preprocessed_tensors to every patient in every group.
+    Load a preprocessed .npy trial, remove cycles containing NaN/Inf,
+    and keep only files with valid data.
+
+    Returns:
+        True if at least one cycle remains and file is kept,
+        False if all cycles were corrupt (file removed).
+    """
+    arr = np.load(input_path).astype(np.float32)
+    # Keep only fully finite cycles
+    mask = np.isfinite(arr).all(axis=(1, 2))
+    clean = arr[mask]
+    if clean.size > 0:
+        # Save cleaned data back to the same path
+        np.save(input_path, clean)
+        return True
+    else:
+        # Remove the file entirely if no valid cycles remain
+        try:
+            os.remove(input_path)
+        except OSError:
+            pass
+        return False
+
+def preprocess_all_groups_and_patients(
+    target_length: int,
+    num_kinematic_variables: int,
+    global_scaler,
+    subfolder_name: str = "preprocessed",
+    verbose: bool = False
+):
+    """
+    Applies save_patient_preprocessed_tensors to every patient in every group,
+    then cleans each generated .npy by removing cycles with NaN/Inf.
 
     Args:
         target_length: Timesteps per cycle for normalization.
-        subfolder_name: Subfolder name for outputs under each patient.
+        num_kinematic_variables: Number of biomechanical variables.
+        global_scaler: Scaler trained on training set.
+        subfolder_name: Subfolder name where preprocessed .npy are saved.
         verbose: Print progress.
     """
     for group_code, group_path in base_folders.items():
         if verbose:
             print(f"\n[INFO] Processing group: {group_code}")
         patient_ids = [d for d in os.listdir(group_path)
-                       if os.path.isdir(os.path.join(group_path, d))]
+                        if os.path.isdir(os.path.join(group_path, d))]
+
         for pid in patient_ids:
-            if verbose:
-                print(f"[INFO]  Patient: {pid}")
             try:
-                save_patient_preprocessed_tensors(pid, group_code,
-                                                 target_length,
-                                                 num_kinematic_variables,
-                                                 global_scaler,
-                                                 subfolder_name,
-                                                 verbose)
+                if verbose:
+                    print(f"[INFO]  Patient: {pid}")
+                # 1) Save raw preprocessed tensors for the patient
+                save_patient_preprocessed_tensors(
+                    pid, group_code,
+                    target_length,
+                    num_kinematic_variables,
+                    global_scaler,
+                    subfolder_name,
+                    verbose
+                )
+
+                # 2) Clean each .npy in the subfolder
+                pre_dir = os.path.join(group_path, pid, subfolder_name)
+                for fname in os.listdir(pre_dir):
+                    if fname.endswith("_preprocessed.npy"):
+                        inp = os.path.join(pre_dir, fname)
+                        ok = clean_and_save_trial(inp)
+                        # Print only when an entire file was discarded
+                        if not ok:
+                            print(f"[CLEAN] Discarded corrupt file: {os.path.basename(inp)}")
             except Exception as e:
                 print(f"[ERROR] Patient {pid}: {e}")
-
 
 
 
