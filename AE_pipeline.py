@@ -1,6 +1,7 @@
 """
-End-to-end LSTM Autoencoder pipeline in a single script,
-with logical “module” sections: the data loading (comes from Data_loader.py), TFRecord conversion,
+End-to-end LSTM Autoencoder pipeline
+with logical “module” sections: the data loading (comes from Data_loader.py),
+TFRecord conversion,
 dataset creation, model definition, training, evaluation, anomaly detection,
 and latent feature extraction.
 """
@@ -14,6 +15,9 @@ from tqdm import tqdm
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import Input, Model
+from tensorflow.keras import backend as K
+from tensorflow.keras.optimizers.schedules import ExponentialDecay
+from tensorflow.keras import regularizers
 from tensorflow.keras.layers import LSTM, RepeatVector, TimeDistributed, Dense
 from tensorflow.keras.callbacks import (
     EarlyStopping, ModelCheckpoint,
@@ -34,7 +38,7 @@ np.random.seed(42)
 tf.random.set_seed(42)
 tf.config.experimental.enable_op_determinism()
 
-# Optional mixed precision
+# Mixed precision: to acelerate training & reduce memory 
 try:
     from tensorflow.keras import mixed_precision
     mixed_precision.set_global_policy('mixed_float16')
@@ -42,16 +46,21 @@ try:
 except ImportError:
     print("Mixed precision not available; using float32")
 
-# ─── 1. TFRecord Conversion “Module” ────────────────────────────────────────────
-
-# These constants must match those in Data_loader.py
+# ─── 1. TFRecord Conversion ────────────────────────────────────────────
 NUM_BIOMECHANICAL_VARIABLES = 321
-N_TIMESTEPS = 100
+n_timesteps= 100 #cycle is normalized to 100 points 
 
 def _bytes_feature(value: bytes) -> tf.train.Feature:
+    """
+    Auxiliary function to convert bytes to tf.train.Feature 
+    """    
     return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
 
 def serialize_cycle(cycle: np.ndarray) -> bytes:
+    """
+    key function to prepare an individual "cycle" (a sequence of data)
+    to be saved to a TFRecord
+    """
     cycle = cycle.astype(np.float32)
     raw = cycle.tobytes()
     feature = {'data': _bytes_feature(raw)}
@@ -60,8 +69,8 @@ def serialize_cycle(cycle: np.ndarray) -> bytes:
 
 def write_sharded_tfrecord(npy_paths, output_dir, shard_size=100_000):
     """
-    Divide la lista de npy en varios TFRecord comprimidos en GZIP,
-    cada uno con hasta shard_size ciclos.
+    Divides the npy list into TFRecords .GZIP,
+    each with shard_size cycles
     """
     os.makedirs(output_dir, exist_ok=True)
     options = tf.io.TFRecordOptions(compression_type="GZIP")
@@ -69,10 +78,10 @@ def write_sharded_tfrecord(npy_paths, output_dir, shard_size=100_000):
     count = 0
     writer = None
 
-    for p in tqdm(npy_paths, desc="→ Generando shards"):
+    for p in tqdm(npy_paths, desc="→ Generating shards"):
         arr = np.load(p).astype(np.float32)
         # opcional: recorta a N_TIMESTEPS x NUM_BIOMECHANICAL_VARIABLES
-        arr = arr[:, :N_TIMESTEPS, :NUM_BIOMECHANICAL_VARIABLES]
+        arr = arr[:, :n_timesteps, :NUM_BIOMECHANICAL_VARIABLES]
 
         for cycle in arr:
             if writer is None:
@@ -91,26 +100,34 @@ def write_sharded_tfrecord(npy_paths, output_dir, shard_size=100_000):
         writer.close()
 
 def convert_npy_to_tfrecord(npy_paths, tfrecord_path):
+    """
+    Function to create a tfrecord is the data is not that big 
+    """
     options = tf.io.TFRecordOptions(compression_type="GZIP")
     with tf.io.TFRecordWriter(tfrecord_path, options) as writer:
         for p in tqdm(npy_paths, desc=f"→ {os.path.basename(tfrecord_path)}"):
             arr = np.load(p).astype(np.float32)
-            arr = arr[:, :N_TIMESTEPS, :NUM_BIOMECHANICAL_VARIABLES]
+            arr = arr[:, :n_timesteps, :NUM_BIOMECHANICAL_VARIABLES]
             for cycle in arr:
                 writer.write(serialize_cycle(cycle))
 
-# ─── 2. tf.data Pipeline “Module” ───────────────────────────────────────────────
-
+# ─── 2. tf.data Pipeline ───────────────────────────────────────────────
 BATCH_SIZE = 32
-
 def _parse_cycle(example_proto):
+    """
+    This is the inverse of serialize_cycle.
+    It takes a serialized TFRecord and converts it back to a TensorFlow tensor.
+    """
     feat_desc = {'data': tf.io.FixedLenFeature([], tf.string)}
     parsed = tf.io.parse_single_example(example_proto, feat_desc)
     flat = tf.io.decode_raw(parsed['data'], tf.float32)
-    cycle = tf.reshape(flat, [N_TIMESTEPS, NUM_BIOMECHANICAL_VARIABLES])
-    return cycle, cycle
+    cycle = tf.reshape(flat, [n_timesteps, NUM_BIOMECHANICAL_VARIABLES])
+    return cycle, cycle #la red intenta reconstruir su propia entrada
 
 def create_tfrecord_dataset(tfrecord_paths, is_training=True):
+    """
+    builds the complete data pipeline
+    """
     dataset = tf.data.TFRecordDataset(
         tfrecord_paths,
         compression_type="GZIP",
@@ -125,38 +142,115 @@ def create_tfrecord_dataset(tfrecord_paths, is_training=True):
     return dataset
 
 def make_monolithic_ds(path):
+    """
+    A simplified version for creating a single TFRecord file dataset
+    without the chunking or merging logic
+    for validation or test.
+    """
     return (
         tf.data.TFRecordDataset(path, compression_type="GZIP")
         .map(_parse_cycle, num_parallel_calls=tf.data.AUTOTUNE)
         .batch(BATCH_SIZE)
         .prefetch(tf.data.AUTOTUNE)
     )
-# ─── 3. Model Definition “Module” ───────────────────────────────────────────────
-def build_lstm_autoencoder(n_timesteps, n_vars, latent_dim=64, lr=1e-5):
+
+# ─── 3. Model Definition ───────────────────────────────────────────────
+def r2(y_true, y_pred):
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    ss_total = K.sum(K.square(y_true - K.mean(y_true)))
+    ss_residual = K.sum(K.square(y_true - y_pred))
+    return 1 - (ss_residual / ss_total)
+
+def build_lstm_autoencoder(
+    n_timesteps,
+    n_vars,
+    latent_dim=64,
+    enc_activation='tanh',
+    dec_activation='tanh',
+    dense_activation='linear',
+    recurrent_activation='sigmoid',
+    dropout=0.2,
+    recurrent_dropout=0.2,
+    lr=1e-4,
+    clipnorm=1.0,
+    l2_reg=0.01
+):
     inputs = Input(shape=(n_timesteps, n_vars))
-    x = LSTM(latent_dim, activation='tanh',
-            return_sequences=False,
-            dropout=0.2, recurrent_dropout=0.2)(inputs)
+    x = LSTM(
+        latent_dim,
+        activation=enc_activation,
+        recurrent_activation=recurrent_activation,
+        return_sequences=False,
+        dropout=dropout,
+        recurrent_dropout=recurrent_dropout,
+        kernel_regularizer=regularizers.l2(l2_reg)
+    )(inputs)
+
     x = RepeatVector(n_timesteps)(x)
-    x = LSTM(latent_dim, activation='tanh',
-            return_sequences=True,
-            dropout=0.2, recurrent_dropout=0.2)(x)
-    outputs = TimeDistributed(Dense(n_vars, activation='linear'))(x)
+    x = LSTM(
+        latent_dim,
+        activation=dec_activation,
+        recurrent_activation=recurrent_activation,
+        return_sequences=True,
+        dropout=dropout,
+        recurrent_dropout=recurrent_dropout,
+        kernel_regularizer=regularizers.l2(l2_reg) 
+    )(x)
+    outputs = TimeDistributed(Dense(n_vars, activation=dense_activation,
+                                    kernel_regularizer=regularizers.l2(l2_reg)))(x)
+    
     autoencoder = Model(inputs, outputs, name="LSTM_AE")
-    opt = tf.keras.optimizers.Adam(learning_rate=lr, clipnorm=1.0)
-    autoencoder.compile(optimizer=opt, loss='mse')
+    opt = tf.keras.optimizers.Adam(learning_rate=lr, clipnorm=clipnorm)
+
+    autoencoder.compile(
+        optimizer=opt,
+        loss='mse',
+        metrics=[tf.keras.metrics.RootMeanSquaredError(), r2]  
+    )
     return autoencoder
 
-# ─── 4. Training “Module” ───────────────────────────────────────────────────────
+# ─── 4. Training ───────────────────────────────────────────────────────
 
-def train_autoencoder(model, train_ds, val_ds, epochs=100):
+def train_autoencoder(
+    model,
+    train_ds,
+    val_ds,
+    run_id: str,               
+    epochs=100,
+    model_dir='saved_models',
+    log_dir_root='logs/fit',
+    csv_log_root='training_log',
+    lr_initial=1e-4,
+    lr_decay_rate=0.96,
+    lr_decay_steps=1000
+):
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(log_dir_root, exist_ok=True)
+
+    chkpt_path   = f"{model_dir}/best_ae_{run_id}.keras"
+    tb_log_dir   = f"{log_dir_root}_{run_id}"
+    csv_log_path = f"{csv_log_root}_{run_id}.csv"
+    final_model  = f"{model_dir}/ae_lstm_{run_id}.keras"
+
+    lr_schedule = ExponentialDecay(
+        initial_learning_rate=lr_initial,
+        decay_steps=lr_decay_steps,
+        decay_rate=lr_decay_rate,
+        staircase=True
+    )
+
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
-        ModelCheckpoint('best_ae_lstm.keras', save_best_only=True, monitor='val_loss'),
+        ModelCheckpoint(chkpt_path, save_best_only=True, monitor='val_loss'),
         ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5),
-        TensorBoard(log_dir='logs/fit'),
-        CSVLogger('training_log.csv', append=False)
+        TensorBoard(log_dir=tb_log_dir),
+        CSVLogger(csv_log_path, append=False)
     ]
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+    model.compile(optimizer=optimizer, loss='mse')
+
     history = model.fit(
         train_ds,
         epochs=epochs,
@@ -164,20 +258,23 @@ def train_autoencoder(model, train_ds, val_ds, epochs=100):
         callbacks=callbacks,
         verbose=1
     )
-    os.makedirs('saved_models', exist_ok=True)
-    model.save('saved_models/ae_lstm.keras') 
-    with open('history.json', 'w') as f:
+    
+    model.save(final_model) 
+    with open(f'history_{run_id}.json', 'w') as f:
         json.dump(history.history, f)
     return history
 
-# ─── 5. Evaluation & Anomaly Detection “Module” ────────────────────────────────
-
+# ─── 5. Evaluation & Anomaly Detection ────────────────────────────────
 def evaluate_and_detect(model, test_ds):
     test_loss = model.evaluate(test_ds, verbose=0)
     print(f"Test reconstruction MSE: {test_loss:.6f}")
 
     losses_ds = test_ds.map(
-        lambda x, _: tf.reduce_mean(tf.math.squared_difference(x, model(x)), axis=[1,2]),
+        lambda x, _: tf.reduce_mean(
+            tf.math.squared_difference(
+                tf.cast(x, tf.float32),  
+                tf.cast(model(x), tf.float32) 
+            ), axis=[1, 2]),
         num_parallel_calls=tf.data.AUTOTUNE
     )
     all_losses = np.concatenate([b.numpy() for b in losses_ds], axis=0)
