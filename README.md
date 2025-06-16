@@ -34,8 +34,8 @@ Gait stability is a critical factor in reducing fall risk. Current methodologies
 ## Requirements
 
 - Python 3.8+
-- Libraries: NumPy, Pandas, SciPy, Scikit-learn, TensorFlow/PyTorch, Matplotlib, Seaborn
-- Additional tools: Jupyter Notebook, SolidWorks, Gazebo (for physical simulation)
+- Libraries: NumPy, Pandas, SciPy, Scikit-learn, PyTorch, Matplotlib, Seaborn
+- Additional tools: Jupyter Notebook, SolidWorks, Gazebo for physical simulation
 ``
 
 
