@@ -81,10 +81,10 @@ def compute_L_step_width_and_length(df, heel_strike_R, heel_strike_L, toe_off_L)
     left_step_time = []
 
     n = min(len(heel_strike_R), len(heel_strike_L))
-    for i in range(n - 1):
-        R_idx = heel_strike_R[i]
-        L_idx = heel_strike_L[i]
-        R_next = heel_strike_R[i + 1]
+    for idx in range(n - 1):
+        R_idx = heel_strike_R[idx]
+        L_idx = heel_strike_L[idx]
+        R_next = heel_strike_R[idx + 1]
         if R_idx >= len(time) or L_idx >= len(time) or R_next >= len(time):
             continue
 
@@ -96,9 +96,9 @@ def compute_L_step_width_and_length(df, heel_strike_R, heel_strike_L, toe_off_L)
 
         #step length and time 
         # loop over each right‑foot stride
-        for i in range(len(heel_strike_R) - 1):
-            R0 = heel_strike_R[i]
-            R1 = heel_strike_R[i+1]
+        for j in range(len(heel_strike_R) - 1):
+            R0 = heel_strike_R[j]
+            R1 = heel_strike_R[j+1]
 
             # find the left HS that falls between R0 and R1
             candidates = [l for l in heel_strike_L if R0 < l <= R1]
@@ -161,10 +161,10 @@ def compute_R_step_width_and_length(df, heel_strike_R, heel_strike_L, toe_off_R)
     right_step_time = []
 
     n = min(len(heel_strike_R), len(heel_strike_L))
-    for i in range(n - 1):
-        L_idx = heel_strike_L[i]
-        R_idx = heel_strike_R[i]
-        L_next = heel_strike_L[i + 1]
+    for idx in range(n - 1):
+        L_idx = heel_strike_L[idx]
+        R_idx = heel_strike_R[idx]
+        L_next = heel_strike_L[idx + 1]
         if L_idx >= len(time) or R_idx >= len(time) or L_next >= len(time):
             continue
 
@@ -176,9 +176,9 @@ def compute_R_step_width_and_length(df, heel_strike_R, heel_strike_L, toe_off_R)
 
         # Step time and length 
         # loop over each right‑foot stride
-        for i in range(len(heel_strike_R) - 1):
-            R0 = heel_strike_R[i]
-            R1 = heel_strike_R[i+1]
+        for j in range(len(heel_strike_R) - 1):
+            R0 = heel_strike_R[j]
+            R1 = heel_strike_R[j+1]
 
             # find the left HS that falls between R0 and R1
             candidates = [l for l in heel_strike_L if R0 < l <= R1]
