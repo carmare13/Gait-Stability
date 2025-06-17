@@ -17,7 +17,7 @@ import tensorflow as tf
 from tensorflow.keras import Input, Model
 from tensorflow.keras import backend as K
 from tensorflow.keras.optimizers.schedules import ExponentialDecay
-from tensorflow.keras import regularizers
+from tensorflow.keras import regularizers, initializers 
 from tensorflow.keras.layers import LSTM, RepeatVector, TimeDistributed, Dense
 from tensorflow.keras.callbacks import (
     EarlyStopping, ModelCheckpoint,
@@ -170,11 +170,11 @@ def build_lstm_autoencoder(
     dec_activation='tanh',
     dense_activation='linear',
     recurrent_activation='sigmoid',
-    dropout=0.2,
-    recurrent_dropout=0.2,
+    dropout=0.1,
+    recurrent_dropout=0.1,
     lr=1e-4,
     clipnorm=1.0,
-    l2_reg=0.01
+    l2_reg=0.001
 ):
     inputs = Input(shape=(n_timesteps, n_vars))
     x = LSTM(
@@ -184,6 +184,8 @@ def build_lstm_autoencoder(
         return_sequences=False,
         dropout=dropout,
         recurrent_dropout=recurrent_dropout,
+        kernel_initializer=initializers.GlorotNormal(),  
+        recurrent_initializer=initializers.GlorotNormal(),
         kernel_regularizer=regularizers.l2(l2_reg)
     )(inputs)
 
@@ -195,6 +197,8 @@ def build_lstm_autoencoder(
         return_sequences=True,
         dropout=dropout,
         recurrent_dropout=recurrent_dropout,
+        kernel_initializer=initializers.GlorotNormal(),
+        recurrent_initializer=initializers.GlorotNormal(),
         kernel_regularizer=regularizers.l2(l2_reg) 
     )(x)
     outputs = TimeDistributed(Dense(n_vars, activation=dense_activation,
@@ -217,13 +221,14 @@ def train_autoencoder(
     train_ds,
     val_ds,
     run_id: str,               
-    epochs=100,
+    epochs=50,
     model_dir='saved_models',
     log_dir_root='logs/fit',
     csv_log_root='training_log',
     lr_initial=1e-4,
-    lr_decay_rate=0.96,
-    lr_decay_steps=1000
+    lr_decay_rate=0.98,
+    lr_decay_steps=5000,
+    optimizer=None
 ):
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(log_dir_root, exist_ok=True)
@@ -233,23 +238,41 @@ def train_autoencoder(
     csv_log_path = f"{csv_log_root}_{run_id}.csv"
     final_model  = f"{model_dir}/ae_lstm_{run_id}.keras"
 
-    lr_schedule = ExponentialDecay(
-        initial_learning_rate=lr_initial,
-        decay_steps=lr_decay_steps,
-        decay_rate=lr_decay_rate,
-        staircase=True
-    )
 
     callbacks = [
-        EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+        EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True),
         ModelCheckpoint(chkpt_path, save_best_only=True, monitor='val_loss'),
         ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5),
         TensorBoard(log_dir=tb_log_dir),
         CSVLogger(csv_log_path, append=False)
     ]
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
-    model.compile(optimizer=optimizer, loss='mse')
+    if optimizer is None:
+        lr_schedule = ExponentialDecay(
+            initial_learning_rate=lr_initial,
+            decay_steps=lr_decay_steps,
+            decay_rate=lr_decay_rate,
+            staircase=True
+        )
+        optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+
+    desired_metric_names = {
+        tf.keras.metrics.RootMeanSquaredError().name,
+        r2.__name__
+    }
+    current_metric_names = {m.name for m in getattr(model, "metrics", [])}
+    compile_needed = (
+        model.optimizer is None or
+        model.loss != 'mse' or
+        not desired_metric_names.issubset(current_metric_names) or
+        model.optimizer != optimizer
+    )
+    if compile_needed:
+        model.compile(
+            optimizer=optimizer,
+            loss='mse',
+            metrics=[tf.keras.metrics.RootMeanSquaredError(), r2]
+        )
 
     history = model.fit(
         train_ds,
@@ -285,15 +308,71 @@ def evaluate_and_detect(model, test_ds):
     print(f"Detected {n_anom} anomalies out of {len(all_losses)} (threshold={threshold:.6f})")
     return all_losses, threshold
 
-# ─── 6. Latent Feature Extraction “Module” ─────────────────────────────────────
+# ─── 6. Latent Feature Extraction ─────────────────────────────────────
 
 def extract_and_save_latents(model, test_ds, output_path="latent_features_test.npy"):
-    encoder = Model(inputs=model.input, outputs=model.layers[2].output)
+    encoder = Model(inputs=model.input, outputs=model.layers[1].output)
     latent_ds = test_ds.map(
         lambda x, _: encoder(x),
         num_parallel_calls=tf.data.AUTOTUNE
     )
     latents = np.concatenate([l.numpy() for l in latent_ds], axis=0)
+    # verify latent shape is (batch_size, latent_dim)
+    latent_dim = encoder.output_shape[-1]
+    assert latents.ndim == 2 and latents.shape[1] == latent_dim, (
+        f"Latents have unexpected shape {latents.shape}, expected (_, {latent_dim})"
+    )
     np.save(output_path, latents)
     print(f"Saved latent features to {output_path}, shape {latents.shape}")
     return latents
+
+# ─── 7. Reconstruct & evaluate ─────────────────────────────────────
+def reconstruct_and_evaluate(model_path: str, data: np.ndarray, attr_idx: list[int], batch_size):
+    """Reconstruct selected attributes and compute reconstruction error.
+
+    Parameters
+    ----------
+    model_path : str
+        Path to the saved Keras autoencoder model.
+    data : np.ndarray
+        Array with shape (n_samples, n_timesteps, n_features) containing the
+        original sequences.
+    attr_idx : list[int]
+        Indices of the attributes to evaluate.
+
+    Returns
+    -------
+    dict
+        Dictionary with MSE, MAE and RMSE for each selected attribute.
+    np.ndarray
+        Reconstructed data for the selected attributes.
+    """
+    # Load model
+    model = tf.keras.models.load_model(
+    model_path,
+    compile=False,
+    custom_objects={'r2': r2}     
+)
+
+    # Reconstruct
+    ds = tf.data.Dataset.from_tensor_slices(data.astype(np.float32))
+    ds = ds.batch(batch_size)
+    recon = model.predict(ds, verbose=1)
+
+    # Select requested attributes
+    orig_subset = data[:, :, attr_idx]
+    recon_subset = recon[:, :, attr_idx]
+
+    # Compute metrics along samples and time dimensions
+    mse = np.mean((orig_subset - recon_subset) ** 2, axis=(0, 1))
+    mae = np.mean(np.abs(orig_subset - recon_subset), axis=(0, 1))
+    rmse = np.sqrt(mse)
+
+    metrics = {
+        "mse": mse,
+        "mae": mae,
+        "rmse": rmse,
+    }
+    return metrics, recon_subset
+
+
