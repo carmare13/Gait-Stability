@@ -67,7 +67,7 @@ def serialize_cycle(cycle: np.ndarray) -> bytes:
     example = tf.train.Example(features=tf.train.Features(feature=feature))
     return example.SerializeToString()
 
-def write_sharded_tfrecord(npy_paths, output_dir, shard_size=100_000):
+def write_sharded_tfrecord(npy_paths, output_dir, shard_size):
     """
     Divides the npy list into TFRecords .GZIP,
     each with shard_size cycles
@@ -112,7 +112,7 @@ def convert_npy_to_tfrecord(npy_paths, tfrecord_path):
                 writer.write(serialize_cycle(cycle))
 
 # ─── 2. tf.data Pipeline ───────────────────────────────────────────────
-BATCH_SIZE = 32
+BATCH_SIZE = 256
 def _parse_cycle(example_proto):
     """
     This is the inverse of serialize_cycle.
@@ -165,15 +165,13 @@ def r2(y_true, y_pred):
 def build_lstm_autoencoder(
     n_timesteps,
     n_vars,
-    latent_dim=64,
+    latent_dim,
     enc_activation='tanh',
     dec_activation='tanh',
     dense_activation='linear',
     recurrent_activation='sigmoid',
     dropout=0.1,
     recurrent_dropout=0.1,
-    lr=1e-4,
-    clipnorm=1.0,
     l2_reg=0.001
 ):
     inputs = Input(shape=(n_timesteps, n_vars))
@@ -181,6 +179,7 @@ def build_lstm_autoencoder(
         latent_dim,
         activation=enc_activation,
         recurrent_activation=recurrent_activation,
+        name="encoder_lstm", 
         return_sequences=False,
         dropout=dropout,
         recurrent_dropout=recurrent_dropout,
@@ -194,6 +193,7 @@ def build_lstm_autoencoder(
         latent_dim,
         activation=dec_activation,
         recurrent_activation=recurrent_activation,
+        name="decoder_lstm",  
         return_sequences=True,
         dropout=dropout,
         recurrent_dropout=recurrent_dropout,
@@ -205,13 +205,6 @@ def build_lstm_autoencoder(
                                     kernel_regularizer=regularizers.l2(l2_reg)))(x)
     
     autoencoder = Model(inputs, outputs, name="LSTM_AE")
-    opt = tf.keras.optimizers.Adam(learning_rate=lr, clipnorm=clipnorm)
-
-    autoencoder.compile(
-        optimizer=opt,
-        loss='mse',
-        metrics=[tf.keras.metrics.RootMeanSquaredError(), r2]  
-    )
     return autoencoder
 
 # ─── 4. Training ───────────────────────────────────────────────────────
@@ -221,14 +214,16 @@ def train_autoencoder(
     train_ds,
     val_ds,
     run_id: str,               
-    epochs=50,
+    epochs,
+    #steps_per_epoch,       # <-- nuevo param
+    #validation_steps,      # <-- nuevo param
     model_dir='saved_models',
     log_dir_root='logs/fit',
     csv_log_root='training_log',
     lr_initial=1e-4,
     lr_decay_rate=0.98,
-    lr_decay_steps=5000,
-    optimizer=None
+    lr_decay_steps=5000,   
+    clipnorm=1.0
 ):
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(log_dir_root, exist_ok=True)
@@ -242,42 +237,34 @@ def train_autoencoder(
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True),
         ModelCheckpoint(chkpt_path, save_best_only=True, monitor='val_loss'),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5),
+        #ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5),
         TensorBoard(log_dir=tb_log_dir),
         CSVLogger(csv_log_path, append=False)
     ]
 
-    if optimizer is None:
-        lr_schedule = ExponentialDecay(
-            initial_learning_rate=lr_initial,
-            decay_steps=lr_decay_steps,
-            decay_rate=lr_decay_rate,
-            staircase=True
-        )
-        optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
-
-    desired_metric_names = {
-        tf.keras.metrics.RootMeanSquaredError().name,
-        r2.__name__
-    }
-    current_metric_names = {m.name for m in getattr(model, "metrics", [])}
-    compile_needed = (
-        model.optimizer is None or
-        model.loss != 'mse' or
-        not desired_metric_names.issubset(current_metric_names) or
-        model.optimizer != optimizer
+    lr_schedule = ExponentialDecay(
+        initial_learning_rate=lr_initial,
+        decay_steps=lr_decay_steps,
+        decay_rate=lr_decay_rate,
+        staircase=True
     )
-    if compile_needed:
-        model.compile(
-            optimizer=optimizer,
-            loss='mse',
-            metrics=[tf.keras.metrics.RootMeanSquaredError(), r2]
-        )
+    
+    optimizer = tf.keras.optimizers.AdamW(learning_rate=lr_schedule,
+                                            clipnorm=clipnorm)
+
+    model.compile(
+        optimizer=optimizer,
+        loss='mse',
+        metrics=[tf.keras.metrics.RootMeanSquaredError(), r2]
+    )
+    
 
     history = model.fit(
         train_ds,
         epochs=epochs,
+        #steps_per_epoch=steps_per_epoch, 
         validation_data=val_ds,
+        #validation_steps=validation_steps,
         callbacks=callbacks,
         verbose=1
     )
@@ -289,7 +276,8 @@ def train_autoencoder(
 
 # ─── 5. Evaluation & Anomaly Detection ────────────────────────────────
 def evaluate_and_detect(model, test_ds):
-    test_loss = model.evaluate(test_ds, verbose=0)
+    results = model.evaluate(test_ds, verbose=0)
+    test_loss = results[0]  # first element is the loss
     print(f"Test reconstruction MSE: {test_loss:.6f}")
 
     losses_ds = test_ds.map(

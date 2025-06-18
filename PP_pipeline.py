@@ -311,7 +311,7 @@ def get_segments_for_group(group_code,
                     unit="patient"):
         if verbose:
             print(f"\n[INFO] Patient {pid}")
-        segs = get_segments_for_patient(pid, group_code, source, verbose)
+        segs = segment_patient_cycles(pid, group_code, source, verbose)
         if segs:
             all_segs[pid] = segs
 

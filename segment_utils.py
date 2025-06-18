@@ -1,5 +1,4 @@
 import pandas as pd
-from collections import deque
 from gait_events import gait_events_HC_JA, gait_events_norm, gait_events_simple
 
 def segment_cycles(df,print_cycle_length=False):
