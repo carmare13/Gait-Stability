@@ -157,7 +157,7 @@ def write_labeled_tfrecord(
     print(f"TFRecord etiquetado creado en: {output_tfrecord}")
 
 # ─── 2. tf.data Pipeline ───────────────────────────────────────────────
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 def _parse_cycle(example_proto):
     """
     This is the inverse of serialize_cycle.
