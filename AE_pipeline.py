@@ -14,11 +14,14 @@ from tqdm import tqdm
 
 import numpy as np
 import tensorflow as tf
+from tensorflow.keras import mixed_precision
+mixed_precision.set_global_policy('mixed_float16')
+from tensorflow.keras.mixed_precision import LossScaleOptimizer
 from tensorflow.keras import Input, Model
 from tensorflow.keras import backend as K
 from tensorflow.keras.optimizers.schedules import ExponentialDecay
 from tensorflow.keras import regularizers, initializers 
-from tensorflow.keras.layers import LSTM, RepeatVector, TimeDistributed, Dense
+from tensorflow.keras.layers import LSTM, RepeatVector, TimeDistributed, Dense, Bidirectional
 from tensorflow.keras.callbacks import (
     EarlyStopping, ModelCheckpoint,
     ReduceLROnPlateau, TensorBoard, CSVLogger
@@ -111,8 +114,50 @@ def convert_npy_to_tfrecord(npy_paths, tfrecord_path):
             for cycle in arr:
                 writer.write(serialize_cycle(cycle))
 
+def write_labeled_tfrecord(
+    test_npy,
+    output_tfrecord: str,
+    label_map: dict,
+    n_timesteps: int = 100,
+    n_vars: int = 321,
+    compression: str = "GZIP"
+):
+    """
+    Escribe un TFRecord con (señal, etiqueta) para validación.
+
+    Args:
+      test_npy: dict de la forma {grupo: [rutas a .npy]}
+      output_tfrecord: ruta de salida (.tfrecord.gz)
+      label_map: mapeo de nombre de grupo → entero de etiqueta
+      n_timesteps: número de pasos temporales por ciclo
+      n_vars: número de variables biomecánicas (321)
+      compression: tipo de compresión ("" o "GZIP")
+    """
+    options = tf.io.TFRecordOptions(compression_type=compression) \
+              if compression else None
+
+    with tf.io.TFRecordWriter(output_tfrecord, options=options) as writer:
+        for group, paths in test_npy.items():
+            lbl = int(label_map[group])
+            for p in paths:
+                arr = np.load(p).astype(np.float32)
+                # recorta a (n_cycles, n_timesteps, n_vars)
+                arr = arr[:, :n_timesteps, :n_vars]
+
+                for cycle in arr:
+                    raw = cycle.tobytes()
+                    feature = {
+                        "data" : tf.train.Feature(bytes_list=tf.train.BytesList(value=[raw])),
+                        "label": tf.train.Feature(int64_list=tf.train.Int64List(value=[lbl]))
+                    }
+                    ex = tf.train.Example(
+                        features=tf.train.Features(feature=feature)
+                    )
+                    writer.write(ex.SerializeToString())
+    print(f"TFRecord etiquetado creado en: {output_tfrecord}")
+
 # ─── 2. tf.data Pipeline ───────────────────────────────────────────────
-BATCH_SIZE = 256
+BATCH_SIZE = 128
 def _parse_cycle(example_proto):
     """
     This is the inverse of serialize_cycle.
@@ -123,6 +168,17 @@ def _parse_cycle(example_proto):
     flat = tf.io.decode_raw(parsed['data'], tf.float32)
     cycle = tf.reshape(flat, [n_timesteps, NUM_BIOMECHANICAL_VARIABLES])
     return cycle, cycle #la red intenta reconstruir su propia entrada
+
+def parse_for_eval(example_proto):
+    feat_desc = {
+      'data' : tf.io.FixedLenFeature([], tf.string),
+      'label': tf.io.FixedLenFeature([], tf.int64),
+    }
+    parsed = tf.io.parse_single_example(example_proto, feat_desc)
+    cycle = tf.io.decode_raw(parsed['data'], tf.float32)
+    cycle = tf.reshape(cycle, [n_timesteps, NUM_BIOMECHANICAL_VARIABLES])
+    label = parsed['label']
+    return cycle, label
 
 def create_tfrecord_dataset(tfrecord_paths, is_training=True):
     """
@@ -207,6 +263,81 @@ def build_lstm_autoencoder(
     autoencoder = Model(inputs, outputs, name="LSTM_AE")
     return autoencoder
 
+def build_bilstm_autoencoder(
+    n_timesteps,
+    n_vars,
+    latent_dim,
+    enc_activation='tanh',
+    dec_activation='tanh',
+    dense_activation='linear',
+    recurrent_activation='sigmoid',
+    dropout=0.3,
+    recurrent_dropout=0.3,
+    l2_reg=0.001
+):
+    """
+    Autoencoder with bidirectional encoder and decoder.
+    The encoder is a BiLSTM that concatenates both directions
+    (2 × latent\_dim), then optionally we reduce it to latent\_dim with a Dense layer.
+
+    """
+
+    inputs = Input(shape=(n_timesteps, n_vars), name="ae_input")
+
+    # — Encoder Bi-LSTM —
+    # Salida será (batch, 2*latent_dim)
+    x = Bidirectional(
+        LSTM(
+            latent_dim,
+            activation=enc_activation,
+            recurrent_activation=recurrent_activation,
+            return_sequences=False,
+            dropout=dropout,
+            recurrent_dropout=recurrent_dropout,
+            kernel_initializer=initializers.GlorotNormal(),
+            recurrent_initializer=initializers.GlorotNormal(),
+            kernel_regularizer=regularizers.l2(l2_reg)
+        ),
+        name="encoder_bilstm"
+    )(inputs)
+
+    # Reducimos de 2*latent_dim a latent_dim para el bottleneck puro
+    x = Dense(
+        latent_dim,
+        activation='linear',
+        name="bottleneck_dense",
+        kernel_regularizer=regularizers.l2(l2_reg)
+    )(x)
+
+    # — Decoder —
+    # Volvemos a Expandir al número de timesteps
+    x = RepeatVector(n_timesteps, name="bottleneck_repeat")(x)
+
+    # Bi-LSTM en decoder (return_sequences=True)
+    x = Bidirectional(
+        LSTM(
+            latent_dim,
+            activation=dec_activation,
+            recurrent_activation=recurrent_activation,
+            return_sequences=True,
+            dropout=dropout,
+            recurrent_dropout=recurrent_dropout,
+            kernel_initializer=initializers.GlorotNormal(),
+            recurrent_initializer=initializers.GlorotNormal(),
+            kernel_regularizer=regularizers.l2(l2_reg)
+        ),
+        name="decoder_bilstm"
+    )(x)
+
+    # Capa final que recupera las n_vars originales
+    outputs = TimeDistributed(
+        Dense(n_vars, activation=dense_activation,
+              kernel_regularizer=regularizers.l2(l2_reg)),
+        name="decoder_output"
+    )(x)
+
+    return Model(inputs, outputs, name="BiLSTM_AE")
+
 # ─── 4. Training ───────────────────────────────────────────────────────
 
 def train_autoencoder(
@@ -215,8 +346,8 @@ def train_autoencoder(
     val_ds,
     run_id: str,               
     epochs,
-    #steps_per_epoch,       # <-- nuevo param
-    #validation_steps,      # <-- nuevo param
+    steps_per_epoch,       # <-- nuevo param
+    validation_steps,      # <-- nuevo param
     model_dir='saved_models',
     log_dir_root='logs/fit',
     csv_log_root='training_log',
@@ -235,7 +366,7 @@ def train_autoencoder(
 
 
     callbacks = [
-        EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True),
+        EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
         ModelCheckpoint(chkpt_path, save_best_only=True, monitor='val_loss'),
         #ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5),
         TensorBoard(log_dir=tb_log_dir),
@@ -249,11 +380,12 @@ def train_autoencoder(
         staircase=True
     )
     
-    optimizer = tf.keras.optimizers.AdamW(learning_rate=lr_schedule,
+    base_opt = tf.keras.optimizers.AdamW(learning_rate=lr_schedule,
                                             clipnorm=clipnorm)
+    opt = LossScaleOptimizer(base_opt)
 
     model.compile(
-        optimizer=optimizer,
+        optimizer=opt,
         loss='mse',
         metrics=[tf.keras.metrics.RootMeanSquaredError(), r2]
     )
