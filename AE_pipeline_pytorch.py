@@ -11,7 +11,6 @@ import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DataLoader
 
 
 # Asegúrate de que Data_loader.py está en el mismo directorio
@@ -49,6 +48,7 @@ class LazyGaitDataset(Dataset):
         self.indexes = []
         self.n_timesteps = n_timesteps
         self.n_vars = n_vars
+        self._cache: Dict[str, np.ndarray] = {}
         for p in npy_paths:
             arr = np.load(p, mmap_mode='r')
             for i in range(arr.shape[0]):
@@ -57,7 +57,9 @@ class LazyGaitDataset(Dataset):
         return len(self.indexes)
     def __getitem__(self, idx):
         p, i = self.indexes[idx]
-        arr = np.load(p, mmap_mode='r')
+        if p not in self._cache:
+            self._cache[p] = np.load(p, mmap_mode='r')
+        arr = self._cache[p]
         cycle = arr[i, :self.n_timesteps, :self.n_vars].astype(np.float32)
         t = torch.from_numpy(cycle)
         return t, t
@@ -69,7 +71,7 @@ def create_dataloader(npy_paths, batch_size=256, is_train=True, **kwargs):
         batch_size=batch_size,
         shuffle=is_train,
         num_workers=8,
-        pin_memory=False,
+        pin_memory=(device.type == 'cuda'),
         persistent_workers=True,  # workers permanentes
         prefetch_factor=2         # lotes por worker en buffer
     )
@@ -89,6 +91,7 @@ class TestGaitDataset(Dataset):
         self.indexes = []
         self.n_timesteps = n_timesteps
         self.n_vars = n_vars
+        self._cache: Dict[str, np.ndarray] = {}
 
         for group, subjects in subjects_by_group.items():
             root = base_folders[group]
@@ -116,7 +119,9 @@ class TestGaitDataset(Dataset):
         info = self.indexes[idx]
         p = info["path"]
         i = info["cycle_idx"]
-        arr = np.load(p, mmap_mode='r')
+        if p not in self._cache:
+            self._cache[p] = np.load(p, mmap_mode='r')
+        arr = self._cache[p]
         cycle = arr[i, :self.n_timesteps, :self.n_vars].astype(np.float32)
         t = torch.from_numpy(cycle)
 
@@ -140,7 +145,7 @@ def create_test_dataloader(npy_paths,
         batch_size=batch_size,
         shuffle=False,          # normalmente no barajamos en test
         num_workers=4,
-        pin_memory=False,
+        pin_memory=(device.type == 'cuda'),
         persistent_workers=True,  # workers permanentes
         prefetch_factor=2         # lotes por worker en buffer
     )
@@ -217,7 +222,7 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
         model.train()
         train_loss = 0.
         for step, (x, _) in enumerate(train_loader):
-            x = x.to(device)
+            x = x.to(device, non_blocking=True)
             optimizer.zero_grad()
             with autocast():
                 recon = model(x)
@@ -237,8 +242,10 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
         with torch.no_grad():
             for x, _ in val_loader:
                 x = x.to(device, non_blocking=True)
-                recon = model(x)
-                val_loss += nn.functional.mse_loss(recon, x).item()
+                with autocast():
+                    recon = model(x)
+                    loss = nn.functional.mse_loss(recon, x)
+                val_loss += loss.item()
         val_loss /= len(val_loader)
 
         writer.add_scalar('Loss/train', train_loss, epoch)
@@ -264,7 +271,8 @@ def evaluate_and_detect(model, test_loader):
                 x = batch
             # Asegurarse de que x está en GPU/CPU según corresponda
             x = x.to(device, non_blocking=True)
-            recon = model(x)
+            with autocast():
+                recon = model(x)
             # reconstrucción vs original
             batch_losses = ((recon - x) ** 2).mean(dim=(1, 2)).cpu().numpy()
             losses.append(batch_losses)
@@ -297,18 +305,17 @@ def extract_and_save_latents(
     with torch.no_grad():
         for x, _ in loader:
             x = x.to(device, non_blocking=True)
+            with autocast():
+                # Si el modelo tiene un método `encode`, lo usamos
+                if hasattr(model, "encode"):
+                    # BiLSTMAutoencoder
+                    z = model.encode(x)  # (B, latent_dim)
 
-            # Si el modelo tiene un método `encode`, lo usamos
-            if hasattr(model, "encode"):
-                # BiLSTMAutoencoder
-                z = model.encode(x) # (B, latent_dim)
-
-            else:
-                # LSTMAutoencoder unidireccional
-                _, (h_n, _) = model.encoder(x) # (1, B, H)
-                # Aplanar (batch, hidden)
-                z = h_n.squeeze(0)                      # (B, H)
-
+                else:
+                    # LSTMAutoencoder unidireccional
+                    _, (h_n, _) = model.encoder(x)  # (1, B, H)
+                    # Aplanar (batch, hidden)
+                    z = h_n.squeeze(0)  # (B, H)
             latents.append(z.cpu().numpy())
 
     latents = np.concatenate(latents, axis=0)
@@ -322,15 +329,22 @@ def reconstruct_and_evaluate(model_path, data, attr_idx, batch_size, n_timesteps
     model.load_state_dict(torch.load(model_path))
     model.eval()
 
-    ds = torch.utils.data.TensorDataset(torch.from_numpy(data.astype(np.float32)), torch.zeros(len(data)))
-    loader = DataLoader(ds, batch_size=batch_size)
+    ds = torch.utils.data.TensorDataset(
+        torch.from_numpy(data.astype(np.float32)), torch.zeros(len(data))
+    )
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        pin_memory=(device.type == 'cuda'),
+    )
 
     recon_list = []
     with torch.no_grad():
         for x, _ in loader:
-            x = x.to(device)
-            recon = model(x).cpu().numpy()
-            recon_list.append(recon)
+            x = x.to(device, non_blocking=True)
+            with autocast():
+                recon = model(x)
+            recon_list.append(recon.cpu().numpy())
     recon = np.concatenate(recon_list, axis=0)
 
     orig = data[:, :, attr_idx]
