@@ -12,17 +12,11 @@ from torch.amp import GradScaler
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast
+import zarr
+from torch.utils.data import IterableDataset, get_worker_info
 
 import time 
-
-""""
-# Asegúrate de que Data_loader.py está en el mismo directorio
-from Data_loader import (
-    load_subjects_from_json,
-      get_all_npy_paths_by_group,
-        base_folders
-)
-"""
+import psutil
 
 # ─── Seeds ─────────────────────────────────────────────────────────────
 os.environ['PYTHONHASHSEED'] = '0'
@@ -38,9 +32,6 @@ torch.backends.cudnn.benchmark = False
 
 
 # ─── Configuración ──────────────────────────────────────────────────────
-
-BATCH_SIZE = 256
-NUM_BIOMECHANICAL_VARIABLES = 321
 n_timesteps= 100 #cycle is normalized to 100 points 
 
 # ─── Device ────────────────────────────────────────────────────────────
@@ -49,278 +40,67 @@ print(f"Using device: {device}")
 
 
 # ─── 1. Dataset ─────────────────────────────────────────────────────────
-class LazyGaitDataset(Dataset):
-    def __init__(self, npy_paths, n_timesteps=100, n_vars=321):
-        self.n_timesteps = n_timesteps
-        self.n_vars      = n_vars
-
-        self.arrays = {}
-        for p in npy_paths:
-            arr = np.load(p, mmap_mode='r')
-            _ = arr[:]   # fuerza la lectura de *todas* las páginas en cache de SO
-            self.arrays[p] = arr
-
-
-        """
-        self.arrays = {
-            p: np.load(p, mmap_mode='r')
-            for p in npy_paths
-        }
-        """
-
-        # 2) Prepara la lista de índices
-        self.indexes = [
-            (p, i)
-            for p, arr in self.arrays.items()
-            for i in range(arr.shape[0])
-        ]
-
-
-
-        
-        """
-        self.indexes = []
-        self.n_timesteps = n_timesteps
-        self.n_vars = n_vars
-        self._cache: Dict[str, np.ndarray] = {}
-        for p in npy_paths:
-            arr = np.load(p, mmap_mode='r')
-            for i in range(arr.shape[0]):
-                self.indexes.append((p, i))
-"""
-
-    def __len__(self):
-        return len(self.indexes)
-    
-
-    def __getitem__(self, idx):
-        p, i = self.indexes[idx]
-
-        """
-        if p not in self._cache:
-            self._cache[p] = np.load(p, mmap_mode='r')
-        """
-        arr = self.arrays[p]  # ya está mapeado
-        #arr = self._cache[p]
-
-        cycle = arr[i, :self.n_timesteps, :self.n_vars].astype(np.float32)
-        t = torch.from_numpy(cycle)
-        return t, t
-
-def create_dataloader(npy_paths, batch_size=256, is_train=True, **kwargs):
-    ds = LazyGaitDataset(npy_paths, **kwargs)
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=is_train,
-        num_workers=24,
-        pin_memory=False,
-        #pin_memory=(device.type == 'cuda'),
-        persistent_workers=True,  # workers permanentes
-        prefetch_factor=4         # lotes por worker en buffer
-    )
-
-class TestGaitDataset(Dataset):
-    def __init__(self,
-                 npy_paths,
-                 subjects_by_group: Dict[str, List[str]],
-                 base_folders: Dict[str,str],
-                 n_timesteps=100,
-                 n_vars=321):
-        """
-        npy_paths: lista de rutas a .npy (generada con get_all_npy_paths_by_group).
-        subjects_by_group: e.g. {"G01": [...ids...], "G03": [...]}.
-        base_folders: mapeo de grupo → carpeta raíz donde están los .npy.
-        """
-        self.indexes = []
-        self.n_timesteps = n_timesteps
-        self.n_vars = n_vars
-        self._cache: Dict[str, np.ndarray] = {}
-
-        for group, subjects in subjects_by_group.items():
-            root = base_folders[group]
-            for subj in subjects:
-                # reconstruye rutas .npy de ese sujeto:
-                # (o filtra npy_paths que contengan group y subj)
-                subj_paths = [
-                    p for p in npy_paths
-                    if f"/{group}/" in p and f"/{subj}/" in p
-                ]
-                for p in subj_paths:
-                    arr = np.load(p, mmap_mode='r')
-                    for i in range(arr.shape[0]):
-                        self.indexes.append({
-                            "path": p,
-                            "cycle_idx": i,
-                            "group": group,
-                            "subject": subj
-                        })
-
-    def __len__(self):
-        return len(self.indexes)
-
-    def __getitem__(self, idx):
-        info = self.indexes[idx]
-        p = info["path"]
-        i = info["cycle_idx"]
-        if p not in self._cache:
-            self._cache[p] = np.load(p, mmap_mode='r')
-        arr = self._cache[p]
-        cycle = arr[i, :self.n_timesteps, :self.n_vars].astype(np.float32)
-        t = torch.from_numpy(cycle)
-
-        # metadata: 5 campos que puedes serializar como entero o string
-        meta = {
-            "group":    info["group"],
-            "subject":  info["subject"],
-            "cycle":    i,
-            # añade aquí los otros 2 campos de metadata que necesites
-        }
-        return t, t, meta
-    
-def create_test_dataloader(npy_paths,
-                           subjects_by_group,
-                           base_folders,
-                           batch_size=256,
-                           **kwargs):
-    ds = TestGaitDataset(npy_paths, subjects_by_group, base_folders, **kwargs)
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=False,          # normalmente no barajamos en test
-        num_workers=4,
-        pin_memory=False,
-        #pin_memory=(device.type == 'cuda'),
-        persistent_workers=True,  # workers permanentes
-        prefetch_factor=2         # lotes por worker en buffer
-    )
-
-# class GaitCycleDataset(Dataset):
-#     def __init__(self, npy_paths, return_meta=False):
-#         """
-#         npy_paths: lista de rutas a archivos .npy cada uno con shape (n_cycles, 100, 326)
-#         return_meta: si True, __getitem__ retornará (features, metadata)
-#         """
-#         self.return_meta = return_meta
-#         # Cargar memmaps y calcular conteos
-#         self._memmaps = []
-#         self._counts = []
-#         for p in npy_paths:
-#             arr = np.load(p, mmap_mode='r')  # no ocupa RAM completa
-#             assert arr.ndim == 3 and arr.shape[1] == 100 and arr.shape[2] == 326
-#             self._memmaps.append(arr)
-#             self._counts.append(arr.shape[0])
-#         # índices acumulados para mapear idx -> (file_idx, cycle_idx)
-#         self._cum_counts = np.concatenate(([0], np.cumsum(self._counts)))
-#         self.total_cycles = int(self._cum_counts[-1])
-
-#     def __len__(self):
-#         return self.total_cycles
-
-#     def __getitem__(self, idx):
-#         # localizar archivo
-#         # cum_counts: [0, c1, c1+c2, ...]
-#         file_idx = np.searchsorted(self._cum_counts, idx, side='right') - 1
-#         cycle_idx = idx - self._cum_counts[file_idx]
-#         data = self._memmaps[file_idx][cycle_idx]  # (100, 326)
-
-
-#         feat_np = data[:, :321].copy()
-#         features = torch.from_numpy(feat_np).float()
-
-#         if self.return_meta:
-#             # Metadata: últimas 5 columnas → también copiar
-#             meta_np = data[:, 321:].copy()
-#             meta = torch.from_numpy(meta_np).float()
-#             return features, meta
-#         else:
-#             return features
-class GaitCycleDataset(Dataset):
-    def __init__(self, npy_paths, return_meta=False):
+class GaitBatchIterable(IterableDataset):
+    def __init__(self, store_path, batch_size, return_meta=False):
+        self._z = zarr.open(store_path, mode="r")["data"]
+        self.bs = batch_size
         self.return_meta = return_meta
-        self._memmaps = []
-        self._counts = []
-        for p in npy_paths:
-            arr = np.load(p, mmap_mode='r')
-            assert arr.ndim == 3 and arr.shape[1] == 100 and arr.shape[2] == 326
-            self._memmaps.append(arr)
-            self._counts.append(arr.shape[0])
-
-        # total number of cycles
-        self.total_cycles = sum(self._counts)
-
-        # build lookup tables
-        self._file_indices = np.empty(self.total_cycles, dtype=np.int32)
-        self._cycle_indices = np.empty(self.total_cycles, dtype=np.int32)
-        offset = 0
-        for file_idx, cnt in enumerate(self._counts):
-            self._file_indices[offset:offset+cnt] = file_idx
-            self._cycle_indices[offset:offset+cnt] = np.arange(cnt, dtype=np.int32)
-            offset += cnt
+        self.n = len(self._z) # Total number of individual cycles
 
     def __len__(self):
-        return self.total_cycles
+        return self.n // self.bs  # number of full batches we will yield   
 
-    def __getitem__(self, idx):
-        fi = self._file_indices[idx]
-        ci = self._cycle_indices[idx]
-        data = self._memmaps[fi][ci]   # shape (100, 326)
+    def __iter__(self):
+        # one per worker
+        worker_info = get_worker_info()
+        rng = np.random.default_rng(worker_info.id if worker_info else None)
 
-        # avoid double-copy + dtype conversions
-        feat_np = data[:, :321].astype(np.float32, copy=False)
-        features = torch.from_numpy(feat_np)
-        if self.return_meta:
-            meta_np = data[:, 321:].astype(np.float32, copy=False)
-            meta = torch.from_numpy(meta_np)
-            return features, meta
+        all_batch_start_idxs = np.arange(0, self.n, self.bs)
+        rng.shuffle(all_batch_start_idxs)
+
+        if worker_info:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+
+            num_batches_total = len(all_batch_start_idxs)
+            num_batches_per_worker = num_batches_total // num_workers
+            remainder_batches = num_batches_total % num_workers
+
+            start_idx = worker_info.id * num_batches_per_worker
+            end_idx = (worker_info.id + 1) * num_batches_per_worker
+            
+            # The last worker handles any remaining batches
+            start_idx += min(worker_id, remainder_batches)
+            end_idx += min(worker_id, remainder_batches)
+            if worker_id < remainder_batches:
+                end_idx += 1 # This worker takes one extra batch from the remainder
+
+            worker_batch_start_idxs = all_batch_start_idxs[start_idx:end_idx]
         else:
-            return features
+            # Main process case (num_workers=0) - all batches go to the main process
+            worker_batch_start_idxs = all_batch_start_idxs
 
-def get_dataloaders(
-    train_paths, val_paths, test_paths=None,
-    batch_size=4000, num_workers=4, pin_memory=True
-):
-    """
-    Devuelve tus DataLoader para train, val y (opcional) test.
-    - train/val: shuffle=True, devuelve tensores [batch,100,321]
-    - test: shuffle=False, devuelve (tensores de features, tensores de meta)
-    """
-    train_ds = GaitCycleDataset(train_paths, return_meta=False)
-    val_ds   = GaitCycleDataset(val_paths,   return_meta=False)
+        # Now, iterate through the batch starting indices assigned to this worker
+        for start_of_batch_idx in worker_batch_start_idxs:
+            # Construct the actual indices for the current batch
+            # This ensures that even the last batch (if smaller) is included
+            batch_idxs = np.arange(start_of_batch_idx, min(start_of_batch_idx + self.bs, self.n))
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        prefetch_factor=2 ,
-        persistent_workers=True
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=True
-    )
+            # No 'pass' needed for 'if len(batch_idxs) < self.bs:' as the slicing already handles it.
+            # The 'data' will simply be of the actual size available.
 
-    if test_paths is not None:
-        test_ds = GaitCycleDataset(test_paths, return_meta=True)
-        test_loader = DataLoader(
-            test_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=True
-        )
-        return train_loader, val_loader, test_loader
+            data = self._z[batch_idxs] # ONE C-read of size len(batch_idxs) × 100 × 326
+            
+            # Convert NumPy arrays to PyTorch tensors
+            feat_np = data[:, :, :321]    # (current_bs,100,321)
+            feat    = torch.from_numpy(feat_np)
 
-    return train_loader, val_loader
-
-
+            if self.return_meta:
+                meta_np = data[:, :, 321:]  # (current_bs,100,5)
+                meta    = torch.from_numpy(meta_np)
+                yield feat, meta
+            else:
+                yield feat, feat
 
 # ─── 2. Model Definitions ────────────────────────────────────────────────
 class LSTMAutoencoder(nn.Module):
@@ -395,12 +175,14 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
 
     best_val = float('inf')
     epochs_no_improve = 0
+    process = psutil.Process(os.getpid())
 
     for epoch in range(1, epochs+1):
         model.train()
         train_loss = 0.0
 
         if debug:
+            torch.cuda.reset_peak_memory_stats()
             t0 = time.perf_counter()
 
         for step, (x, _) in enumerate(train_loader):
@@ -417,25 +199,45 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
             with autocast(device_type=device.type):
                 recon = model(x)
                 loss = nn.functional.mse_loss(recon, x)
+
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
             scaler.step(optimizer)
             scaler.update()
-
             scheduler.step()
+
             train_loss += loss.item()
 
             if debug:
                 torch.cuda.synchronize()
                 t3 = time.perf_counter()
-                print(f"[Epoch {epoch}] Batch {step}: "
-                      f"I/O={(t1-t0):.3f}s, memcpy={(t2-t1):.3f}s, comp+back={(t3-t2):.3f}s")
-                t0 = t3
+
+                # —— medición de memoria GPU —— 
+                used = torch.cuda.memory_allocated(device)           # bytes actuales
+                peak = torch.cuda.max_memory_allocated(device)       # bytes pico
+                # —— medición de memoria CPU —— 
+                mem = process.memory_info().rss                       # RSS en bytes
+
+                print(
+                    f"[Epoch {epoch}] Batch {step}: "
+                    f"I/O={(t1-t0):.3f}s, memcpy={(t2-t1):.3f}s, comp+back={(t3-t2):.3f}s, "
+                    f"GPU_used={used/1e9:.2f}GB, GPU_peak={peak/1e9:.2f}GB, "
+                    f"CPU_RSS={mem/1e9:.2f}GB"
+                )
+                t0 = time.perf_counter()
                 if step >= debug_batches-1:
                     break
 
         train_loss /= len(train_loader)
+        writer.add_scalar('Loss/train', train_loss, epoch)
+
+        # —— guarda estadísticas de memoria por época —— 
+        if debug:
+            epoch_gpu_peak = torch.cuda.max_memory_allocated(device)
+            epoch_cpu_rss = process.memory_info().rss
+            writer.add_scalar('Mem/GPU_peak_GB', epoch_gpu_peak/1e9, epoch)
+            writer.add_scalar('Mem/CPU_RSS_GB', epoch_cpu_rss/1e9, epoch)
 
         # Validación
         model.eval()
