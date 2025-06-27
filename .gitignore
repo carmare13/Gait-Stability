@@ -2,6 +2,7 @@
 # Ignorar datos y resultados locales
 *.csv
 *.txt
+!requirements.txt
 *.png
 *.json
 *.pkl
@@ -13,5 +14,8 @@ NONAN_Library_main/
 prueba.ipynb
 saved_models
 logs
+test_cycles.zarr
+train_cycles.zarr
+val_cycles.zarr
 
 __pycache__/
