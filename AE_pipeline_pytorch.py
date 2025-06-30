@@ -14,6 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast
 import zarr
 from torch.utils.data import IterableDataset, get_worker_info
+import torch.nn.functional as F
 
 import time 
 import psutil
@@ -104,69 +105,98 @@ class GaitBatchIterable(IterableDataset):
 
 # ─── 2. Model Definitions ────────────────────────────────────────────────
 class LSTMAutoencoder(nn.Module):
-    def __init__(self, n_timesteps, n_vars, latent_dim):
+    def __init__(self, n_timesteps, n_vars, latent_dim, dropout=0.2):
         super().__init__()
         self.n_timesteps = n_timesteps
+
         self.encoder = nn.LSTM(input_size=n_vars, hidden_size=latent_dim,
                                batch_first=True)
         self.decoder = nn.LSTM(input_size=latent_dim, hidden_size=latent_dim,
                                batch_first=True)
+        
+        self.hidden_layer = nn.Linear(latent_dim, latent_dim)
+        self.dropout = nn.Dropout(dropout)
+
         self.output_layer = nn.Linear(latent_dim, n_vars)
+
     def forward(self, x):
         # x: (batch, seq, vars)
         _, (h_n, _) = self.encoder(x)
         z = h_n.squeeze(0)  # (batch, latent)
+
         z_rep = z.unsqueeze(1).repeat(1, self.n_timesteps, 1)
         dec_out, _ = self.decoder(z_rep)
+
+        h = F.relu(self.hidden_layer(dec_out))  # (batch, seq, latent)
+        h = self.dropout(h)
+
         out = self.output_layer(dec_out)
         return out
 
 class BiLSTMAutoencoder(nn.Module):
-    def __init__(self, n_timesteps, n_vars, latent_dim):
+    def __init__(self, n_timesteps, n_vars, latent_dim, dropout=0.2):
         super().__init__()
         self.n_timesteps = n_timesteps
+        
+        # Encoder bidireccional
         self.encoder = nn.LSTM(input_size=n_vars, hidden_size=latent_dim,
                                batch_first=True, bidirectional=True)
-        self.bottleneck = nn.Linear(2*latent_dim, latent_dim)
+        # Bottleneck para reducir 2*latent_dim → latent_dim
+        self.bottleneck = nn.Linear(2 * latent_dim, latent_dim)
+        
+        # Decoder bidireccional
         self.decoder = nn.LSTM(input_size=latent_dim, hidden_size=latent_dim,
                                batch_first=True, bidirectional=True)
-        self.output_layer = nn.Linear(2*latent_dim, n_vars)
+        
+        # Capa oculta y dropout (trabajan sobre 2*latent_dim)
+        self.hidden_layer = nn.Linear(2 * latent_dim, 2 * latent_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Capa de salida
+        self.output_layer = nn.Linear(2 * latent_dim, n_vars)
+    
     def encode(self, x):
         """
         Devuelve el vector latente z para cada muestra de x.
         """
-        enc_out, _ = self.encoder(x)
-        last = enc_out[:, -1, :]       # (batch, 2*latent_dim)
-        z    = self.bottleneck(last)   # (batch, latent_dim)
+        enc_out, _ = self.encoder(x)             # (batch, seq, 2*latent_dim)
+        last    = enc_out[:, -1, :]             # (batch, 2*latent_dim)
+        z       = self.bottleneck(last)         # (batch, latent_dim)
         return z
 
     def decode(self, z):
         """
-        Reconstruye la secuencia a partir de z. 
-        Aquí repetimos z en cada timestep como input al decoder.
+        Reconstruye la secuencia a partir de z, con capa oculta y dropout.
         """
-        # z: (batch, latent_dim) → (batch, 1, latent_dim) → (batch, n_timesteps, latent_dim)
+        # (batch, latent_dim) → (batch, seq, latent_dim)
         z_rep = z.unsqueeze(1).repeat(1, self.n_timesteps, 1)
-        dec_out, _ = self.decoder(z_rep)
-        out = self.output_layer(dec_out)
+        dec_out, _ = self.decoder(z_rep)         # (batch, seq, 2*latent_dim)
+        
+        # Capa oculta + activación + dropout
+        h = F.relu(self.hidden_layer(dec_out))   # (batch, seq, 2*latent_dim)
+        h = self.dropout(h)
+        
+        # Capa final de reconstrucción
+        out = self.output_layer(h)               # (batch, seq, vars)
         return out
 
     def forward(self, x):
         z = self.encode(x)
         return self.decode(z)
-
 # ─── 3. Training ────────────────────────────────────────────────────────
 def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
                       model_dir='saved_models', log_dir='logs',
                       lr_initial=1e-4, lr_decay_rate=0.98, lr_decay_steps=5000,
-                      clip_norm=1.0, patience=5,
+                      clip_norm=1.0, patience=5, return_history: bool = False,
                       debug: bool = False,
                       debug_batches: int = 10):
+    
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
+    model.to(device)
 
     writer = SummaryWriter(f"{log_dir}/{run_id}")
-    scaler = GradScaler(device="cuda")
+    scaler = GradScaler()
     optimizer = optim.AdamW(model.parameters(), lr=lr_initial)
     scheduler = optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -176,10 +206,12 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
     best_val = float('inf')
     epochs_no_improve = 0
     process = psutil.Process(os.getpid())
+    train_hist, val_hist = [], []
 
     for epoch in range(1, epochs+1):
         model.train()
         train_loss = 0.0
+        
 
         if debug:
             torch.cuda.reset_peak_memory_stats()
@@ -190,15 +222,15 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
                 t1 = time.perf_counter()
 
             x = x.to(device, non_blocking=True)
-            #x = x.to(device)
+
             if debug:
-                torch.cuda.synchronize()    # aseguramos que la copia termine
+                torch.cuda.synchronize(device)    # aseguramos que la copia termine
                 t2 = time.perf_counter()
 
             optimizer.zero_grad()
             with autocast(device_type=device.type):
                 recon = model(x)
-                loss = nn.functional.mse_loss(recon, x)
+                loss = F.mse_loss(recon, x)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -210,7 +242,7 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
             train_loss += loss.item()
 
             if debug:
-                torch.cuda.synchronize()
+                torch.cuda.synchronize(device)
                 t3 = time.perf_counter()
 
                 # —— medición de memoria GPU —— 
@@ -231,6 +263,7 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
 
         train_loss /= len(train_loader)
         writer.add_scalar('Loss/train', train_loss, epoch)
+        train_hist.append(train_loss)
 
         # —— guarda estadísticas de memoria por época —— 
         if debug:
@@ -247,18 +280,18 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
                 x_val = x_val.to(device, non_blocking=True)
                 with autocast(device_type=device.type):
                     recon_val = model(x_val)
-                    loss_val = nn.functional.mse_loss(recon_val, x_val)
+                    loss_val = F.mse_loss(recon_val, x_val)
                 val_loss += loss_val.item()
         val_loss /= len(val_loader)
-
-        writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/val', val_loss, epoch)
+        val_hist.append(val_loss)
         print(f"Epoch {epoch}/{epochs}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
 
         # — Early stopping & guardado —
         if val_loss < best_val:
             best_val = val_loss
             epochs_no_improve = 0
+            best_path = f"{model_dir}/best_ae_{run_id}.pth"
             torch.save(model.state_dict(), f"{model_dir}/best_ae_{run_id}.pth")
         else:
             epochs_no_improve += 1
@@ -266,8 +299,13 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
                 print(f"Early stopping at epoch {epoch}")
                 break    
 
-    torch.save(model.state_dict(), f"{model_dir}/ae_lstm_{run_id}.pth")
+    final_path = f"{model_dir}/ae_lstm_{run_id}.pth"
+    torch.save(model.state_dict(), final_path)
+    print(f"[SAVE] Final model → {final_path}")
     writer.close()
+
+    if return_history:
+        return train_hist, val_hist
 
 # ─── 4. Evaluación y detección ─────────────────────────────────────────
 def evaluate_and_detect(model, test_loader):

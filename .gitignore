@@ -17,5 +17,7 @@ logs
 test_cycles.zarr
 train_cycles.zarr
 val_cycles.zarr
+Data_Split
+Results AE
 
 __pycache__/
