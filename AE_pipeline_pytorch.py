@@ -15,6 +15,8 @@ from torch.amp import autocast
 import zarr
 from torch.utils.data import IterableDataset, get_worker_info
 import torch.nn.functional as F
+from sklearn.metrics import mean_absolute_error, r2_score
+from pathlib import Path
 
 import time 
 import psutil
@@ -94,11 +96,11 @@ class GaitBatchIterable(IterableDataset):
             
             # Convert NumPy arrays to PyTorch tensors
             feat_np = data[:, :, :321]    # (current_bs,100,321)
-            feat    = torch.from_numpy(feat_np)
+            feat    = torch.from_numpy(feat_np).float().pin_memory()  #Así el DataLoader sólo copiará punteros y podrá subir muy rápido con non_blocking=True.
 
             if self.return_meta:
                 meta_np = data[:, :, 321:]  # (current_bs,100,5)
-                meta    = torch.from_numpy(meta_np)
+                meta    = torch.from_numpy(meta_np).float().pin_memory()
                 yield feat, meta
             else:
                 yield feat, feat
@@ -127,10 +129,10 @@ class LSTMAutoencoder(nn.Module):
         z_rep = z.unsqueeze(1).repeat(1, self.n_timesteps, 1)
         dec_out, _ = self.decoder(z_rep)
 
-        h = F.relu(self.hidden_layer(dec_out))  # (batch, seq, latent)
+        h = torch.tanh(self.hidden_layer(dec_out))  # (batch, seq, latent)
         h = self.dropout(h)
 
-        out = self.output_layer(dec_out)
+        out = self.output_layer(h)
         return out
 
 class BiLSTMAutoencoder(nn.Module):
@@ -173,7 +175,7 @@ class BiLSTMAutoencoder(nn.Module):
         dec_out, _ = self.decoder(z_rep)         # (batch, seq, 2*latent_dim)
         
         # Capa oculta + activación + dropout
-        h = F.relu(self.hidden_layer(dec_out))   # (batch, seq, 2*latent_dim)
+        h = torch.tanh(self.hidden_layer(dec_out))   # (batch, seq, 2*latent_dim)
         h = self.dropout(h)
         
         # Capa final de reconstrucción
@@ -307,7 +309,55 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
     if return_history:
         return train_hist, val_hist
 
+
+
 # ─── 4. Evaluación y detección ─────────────────────────────────────────
+def evaluate_autoencoder(model, data_loader, device="cpu"):
+    """
+    Evalúa un autoencoder utilizando MSE, MAE y R².
+
+    Parámetros:
+        model : instancia del modelo autoencoder entrenado (PyTorch)
+        data_loader : DataLoader con el conjunto de evaluación
+        device : "cpu" o "cuda" según corresponda
+
+    Retorna:
+        dict con métricas: {"MSE": valor, "MAE": valor, "R2": valor}
+    """
+    model.eval()
+    predictions = []
+    targets = []
+
+    with torch.no_grad():
+        for x_batch, _ in data_loader:
+            x_batch = x_batch.to(device)
+            output = model(x_batch)
+
+            predictions.append(output.cpu())
+            targets.append(x_batch.cpu())
+
+    # Convertir a numpy y a forma plana
+    y_pred = torch.cat(predictions, dim=0).numpy()
+    y_true = torch.cat(targets, dim=0).numpy()
+
+    y_pred_flat = y_pred.reshape(y_pred.shape[0], -1)
+    y_true_flat = y_true.reshape(y_true.shape[0], -1)
+
+    mse = F.mse_loss(torch.tensor(y_pred_flat), torch.tensor(y_true_flat)).item()
+    mae = mean_absolute_error(y_true_flat, y_pred_flat)
+    r2 = r2_score(y_true_flat, y_pred_flat)
+
+    return {"MSE": mse, "MAE": mae, "R2": r2}
+
+# Guardar en archivo
+script_path = Path("/mnt/data/evaluate_autoencoder.py")
+script_path.write_text(inspect.getsource(evaluate_autoencoder))
+script_path.write_text(inspect.getsource(evaluate_autoencoder), encoding='utf-8')
+
+print(f"Script guardado en: {script_path}")
+
+str(file_path)
+
 def evaluate_and_detect(model, test_loader):
     model.eval()
     losses = []
