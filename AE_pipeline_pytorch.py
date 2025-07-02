@@ -15,9 +15,8 @@ from torch.amp import autocast
 import zarr
 from torch.utils.data import IterableDataset, get_worker_info
 import torch.nn.functional as F
-from sklearn.metrics import mean_absolute_error, r2_score
 from pathlib import Path
-
+import inspect
 import time 
 import psutil
 
@@ -96,11 +95,10 @@ class GaitBatchIterable(IterableDataset):
             
             # Convert NumPy arrays to PyTorch tensors
             feat_np = data[:, :, :321]    # (current_bs,100,321)
-            feat    = torch.from_numpy(feat_np).float().pin_memory()  #Así el DataLoader sólo copiará punteros y podrá subir muy rápido con non_blocking=True.
-
+            feat    = torch.from_numpy(feat_np).float()
             if self.return_meta:
                 meta_np = data[:, :, 321:]  # (current_bs,100,5)
-                meta    = torch.from_numpy(meta_np).float().pin_memory()
+                meta    = torch.from_numpy(meta_np).float()
                 yield feat, meta
             else:
                 yield feat, feat
@@ -118,22 +116,38 @@ class LSTMAutoencoder(nn.Module):
         
         self.hidden_layer = nn.Linear(latent_dim, latent_dim)
         self.dropout = nn.Dropout(dropout)
-
         self.output_layer = nn.Linear(latent_dim, n_vars)
+        self.apply(self.init_weights)
 
-    def forward(self, x):
-        # x: (batch, seq, vars)
-        _, (h_n, _) = self.encoder(x)
-        z = h_n.squeeze(0)  # (batch, latent)
+    def encode(self, x):
+        _, (h_n, _) = self.encoder(x)  # h_n: (1, batch, latent_dim)
+        z = h_n.squeeze(0)             # (batch, latent_dim)
+        return z
 
-        z_rep = z.unsqueeze(1).repeat(1, self.n_timesteps, 1)
-        dec_out, _ = self.decoder(z_rep)
-
-        h = torch.tanh(self.hidden_layer(dec_out))  # (batch, seq, latent)
+    def decode(self, z):
+        z_rep = z.unsqueeze(1).repeat(1, self.n_timesteps, 1)  # (batch, seq, latent_dim)
+        dec_out, _ = self.decoder(z_rep)                       # (batch, seq, latent_dim)
+        h = torch.tanh(self.hidden_layer(dec_out))             # (batch, seq, latent_dim)
         h = self.dropout(h)
-
-        out = self.output_layer(h)
+        out = self.output_layer(h)                             # (batch, seq, n_vars)
         return out
+
+    def forward(self, x, return_z=False):
+        z = self.encode(x)
+        out = self.decode(z)
+        return (out, z) if return_z else out
+
+    def init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.LSTM):
+            for name, param in m.named_parameters():
+                if "weight" in name:
+                    nn.init.xavier_uniform_(param)
+                elif "bias" in name:
+                    nn.init.zeros_(param)
 
 class BiLSTMAutoencoder(nn.Module):
     def __init__(self, n_timesteps, n_vars, latent_dim, dropout=0.2):
@@ -149,6 +163,7 @@ class BiLSTMAutoencoder(nn.Module):
         # Decoder bidireccional
         self.decoder = nn.LSTM(input_size=latent_dim, hidden_size=latent_dim,
                                batch_first=True, bidirectional=True)
+        self.norm = nn.LayerNorm(2 * latent_dim)
         
         # Capa oculta y dropout (trabajan sobre 2*latent_dim)
         self.hidden_layer = nn.Linear(2 * latent_dim, 2 * latent_dim)
@@ -156,13 +171,17 @@ class BiLSTMAutoencoder(nn.Module):
         
         # Capa de salida
         self.output_layer = nn.Linear(2 * latent_dim, n_vars)
+
+        self.apply(self.init_weights)
     
     def encode(self, x):
         """
         Devuelve el vector latente z para cada muestra de x.
         """
         enc_out, _ = self.encoder(x)             # (batch, seq, 2*latent_dim)
-        last    = enc_out[:, -1, :]             # (batch, 2*latent_dim)
+        h_forward = enc_out[:, -1, :latent_dim]
+        h_backward = enc_out[:, 0, latent_dim:]
+        last = torch.cat([h_forward, h_backward], dim=1)           # (batch, 2*latent_dim)
         z       = self.bottleneck(last)         # (batch, latent_dim)
         return z
 
@@ -173,6 +192,7 @@ class BiLSTMAutoencoder(nn.Module):
         # (batch, latent_dim) → (batch, seq, latent_dim)
         z_rep = z.unsqueeze(1).repeat(1, self.n_timesteps, 1)
         dec_out, _ = self.decoder(z_rep)         # (batch, seq, 2*latent_dim)
+        dec_out = self.norm(dec_out)      # LayerNorm aplicada
         
         # Capa oculta + activación + dropout
         h = torch.tanh(self.hidden_layer(dec_out))   # (batch, seq, 2*latent_dim)
@@ -182,9 +202,24 @@ class BiLSTMAutoencoder(nn.Module):
         out = self.output_layer(h)               # (batch, seq, vars)
         return out
 
-    def forward(self, x):
+    def forward(self, x, return_z=False):
         z = self.encode(x)
-        return self.decode(z)
+        out = self.decode(z)
+        return (out, z) if return_z else out
+    
+    def init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.LSTM):
+            for name, param in m.named_parameters():
+                if "weight" in name:
+                    nn.init.xavier_uniform_(param)
+                elif "bias" in name:
+                    nn.init.zeros_(param)
+    
+    
 # ─── 3. Training ────────────────────────────────────────────────────────
 def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
                       model_dir='saved_models', log_dir='logs',
@@ -199,7 +234,7 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
 
     writer = SummaryWriter(f"{log_dir}/{run_id}")
     scaler = GradScaler()
-    optimizer = optim.AdamW(model.parameters(), lr=lr_initial)
+    optimizer = optim.AdamW(model.parameters(), lr=lr_initial, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.LambdaLR(
         optimizer,
         lr_lambda=lambda step: lr_decay_rate ** (step // lr_decay_steps)
@@ -231,8 +266,9 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
 
             optimizer.zero_grad()
             with autocast(device_type=device.type):
-                recon = model(x)
+                recon, z = model(x, return_z=True)
                 loss = F.mse_loss(recon, x)
+                loss += 1e-4 * torch.mean(z ** 2)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -349,14 +385,52 @@ def evaluate_autoencoder(model, data_loader, device="cpu"):
 
     return {"MSE": mse, "MAE": mae, "R2": r2}
 
+
+#from sklearn.metrics import mean_absolute_error
+
+def evaluate_autoencoder_streaming(model, loader, device):
+    model.eval()
+    total_mse = 0.0
+    total_mae = 0.0
+    total_samples = 0
+
+    with torch.no_grad():
+        for x_batch, _ in loader:
+            # a CPU device no necesita pin_memory y ya lo tienes desactivado
+            x_batch = x_batch.to(device)
+            out = model(x_batch)
+
+            # mueve al host y calcula en “batch”
+            y_true = x_batch.cpu().numpy().reshape(x_batch.size(0), -1)
+            y_pred = out.cpu().numpy().reshape(out.size(0), -1)
+
+            # métricas “sum-of”
+            batch_size = y_true.shape[0]
+            total_samples += batch_size
+
+            # MSE sumado
+            total_mse += ((y_true - y_pred)**2).sum()
+            # MAE sumado
+            total_mae += abs(y_true - y_pred).sum()
+
+            # liberamos cuanto antes
+            del x_batch, out, y_true, y_pred
+            torch.cuda.empty_cache()
+            import gc; gc.collect()
+
+    mse = total_mse / (total_samples * loader.dataset[0][0].numel())
+    mae = total_mae / (total_samples * loader.dataset[0][0].numel())
+    return {'mse': mse, 'mae': mae}
+
+
 # Guardar en archivo
-script_path = Path("/mnt/data/evaluate_autoencoder.py")
-script_path.write_text(inspect.getsource(evaluate_autoencoder))
-script_path.write_text(inspect.getsource(evaluate_autoencoder), encoding='utf-8')
+#script_path = Path("/mnt/data/evaluate_autoencoder.py")
+#script_path.write_text(inspect.getsource(evaluate_autoencoder))
+#script_path.write_text(inspect.getsource(evaluate_autoencoder), encoding='utf-8')
 
-print(f"Script guardado en: {script_path}")
+#print(f"Script guardado en: {script_path}")
 
-str(file_path)
+#str(file_path)
 
 def evaluate_and_detect(model, test_loader):
     model.eval()
