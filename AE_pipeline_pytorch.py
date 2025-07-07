@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast
 import zarr
@@ -47,13 +47,12 @@ class GaitBatchIterable(IterableDataset):
         self._z = zarr.open(store_path, mode="r")["data"]
         self.bs = batch_size
         self.return_meta = return_meta
-        self.n = len(self._z) # Total number of individual cycles
+        self.n = len(self._z)
 
     def __len__(self):
-        return self.n // self.bs  # number of full batches we will yield   
+        return self.n // self.bs
 
     def __iter__(self):
-        # one per worker
         worker_info = get_worker_info()
         rng = np.random.default_rng(worker_info.id if worker_info else None)
 
@@ -63,42 +62,29 @@ class GaitBatchIterable(IterableDataset):
         if worker_info:
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
+            total_batches = len(all_batch_start_idxs)
+            per_worker = total_batches // num_workers
+            rem = total_batches % num_workers
 
-            num_batches_total = len(all_batch_start_idxs)
-            num_batches_per_worker = num_batches_total // num_workers
-            remainder_batches = num_batches_total % num_workers
-
-            start_idx = worker_info.id * num_batches_per_worker
-            end_idx = (worker_info.id + 1) * num_batches_per_worker
-            
-            # The last worker handles any remaining batches
-            start_idx += min(worker_id, remainder_batches)
-            end_idx += min(worker_id, remainder_batches)
-            if worker_id < remainder_batches:
-                end_idx += 1 # This worker takes one extra batch from the remainder
-
-            worker_batch_start_idxs = all_batch_start_idxs[start_idx:end_idx]
+            start = worker_id * per_worker + min(worker_id, rem)
+            end   = start + per_worker + (1 if worker_id < rem else 0)
+            batch_starts = all_batch_start_idxs[start:end]
         else:
-            # Main process case (num_workers=0) - all batches go to the main process
-            worker_batch_start_idxs = all_batch_start_idxs
+            batch_starts = all_batch_start_idxs
 
-        # Now, iterate through the batch starting indices assigned to this worker
-        for start_of_batch_idx in worker_batch_start_idxs:
-            # Construct the actual indices for the current batch
-            # This ensures that even the last batch (if smaller) is included
-            batch_idxs = np.arange(start_of_batch_idx, min(start_of_batch_idx + self.bs, self.n))
-
-            # No 'pass' needed for 'if len(batch_idxs) < self.bs:' as the slicing already handles it.
-            # The 'data' will simply be of the actual size available.
-
-            data = self._z[batch_idxs] # ONE C-read of size len(batch_idxs) × 100 × 326
-            
-            # Convert NumPy arrays to PyTorch tensors
-            feat_np = data[:, :, :321]    # (current_bs,100,321)
+        for s in batch_starts:
+            batch_idxs = np.arange(s, min(s + self.bs, self.n))
+            data = self._z[batch_idxs]              # (bs, 100, 326)
+            feat_np = data[:, :, :321]              # (bs, 100, 321)
             feat    = torch.from_numpy(feat_np).float()
+            # —— aquí permutamos para (bs, 321, 100):
+            feat = feat.permute(0, 2, 1)
+
             if self.return_meta:
-                meta_np = data[:, :, 321:]  # (current_bs,100,5)
+                meta_np = data[:, :, 321:]          # (bs, 100, 5)
                 meta    = torch.from_numpy(meta_np).float()
+                # opcional: permutar meta también si quieres (bs, 5, 100)
+                meta = meta.permute(0, 2, 1)
                 yield feat, meta
             else:
                 yield feat, feat
@@ -219,6 +205,50 @@ class BiLSTMAutoencoder(nn.Module):
                 elif "bias" in name:
                     nn.init.zeros_(param)
     
+class GaitAutoencoder(nn.Module):
+    def __init__(self, input_channels, seq_length, latent_dim):
+        super().__init__()
+        self.seq_length = seq_length
+
+        # 1) convolucional
+        self.encoder_conv = nn.Sequential(
+            nn.Conv1d(input_channels, 16, 3, stride=2, padding=1),  # 100→50
+            nn.ReLU(True),
+            nn.Conv1d(16, 32, 3, stride=2, padding=1),              # 50→25
+            nn.ReLU(True),
+        )
+
+        # calculamos flat_dim dinámicamente
+        with torch.no_grad():
+            dummy = torch.zeros(1, input_channels, seq_length)
+            c, l = self.encoder_conv(dummy).shape[1:]
+            flat_dim = c * l
+
+        # 2) encoder/decoder FC
+        self.encoder_fc = nn.Linear(flat_dim, latent_dim)
+        self.decoder_fc = nn.Linear(latent_dim, flat_dim)
+
+        # 3) decoder conv vía unflatten
+        self.decoder_conv = nn.Sequential(
+            nn.Unflatten(1, (c, l)),                                 # (batch,32,25)
+            nn.ConvTranspose1d(32, 16, 3, stride=2, padding=1, output_padding=1),  # →50
+            nn.ReLU(True),
+            nn.ConvTranspose1d(16, input_channels, 3, stride=2, padding=1, output_padding=1),  # →100
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        # x: (batch, 321, 100)
+        x_enc = self.encoder_conv(x)            
+        flat  = x_enc.view(x_enc.size(0), -1)    
+        z     = self.encoder_fc(flat)            # (batch, latent_dim)
+
+        up    = self.decoder_fc(z)               # (batch, flat_dim)
+        x_recon = self.decoder_conv(up)          # (batch, 321, 100)
+        # ya sale con 100 pasos, no hace falta recortar
+        return x_recon, z
+
+
     
 # ─── 3. Training ────────────────────────────────────────────────────────
 def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
@@ -389,50 +419,53 @@ def evaluate_autoencoder(model, data_loader, device="cpu"):
 #from sklearn.metrics import mean_absolute_error
 
 def evaluate_autoencoder_streaming(model, loader, device):
+    """
+    Evalúa un autoencoder en batches, calculando MSE y MAE de forma acumulativa.
+
+    """
     model.eval()
     total_mse = 0.0
     total_mae = 0.0
     total_samples = 0
+    per_sample_elems = None   
 
     with torch.no_grad():
-        for x_batch, _ in loader:
-            # a CPU device no necesita pin_memory y ya lo tienes desactivado
-            x_batch = x_batch.to(device)
+        for batch in loader:
+            # Extraer x_batch de (x_batch, _) o directamente x_batch
+            x_batch = batch[0] if isinstance(batch, (list,tuple)) else batch
+            x_batch = x_batch.to(device, non_blocking=True)
+
             out = model(x_batch)
+            # Si tu forward devuelve tupla, extrae la reconstrucción
+            recon = out[0] if isinstance(out, tuple) else out
 
-            # mueve al host y calcula en “batch”
+            # Llevar a NumPy y aplanar
             y_true = x_batch.cpu().numpy().reshape(x_batch.size(0), -1)
-            y_pred = out.cpu().numpy().reshape(out.size(0), -1)
+            y_pred = recon.cpu().numpy().reshape(recon.size(0), -1)
 
-            # métricas “sum-of”
+            # Inicializar per_sample_elems la primera vez
+            if per_sample_elems is None:
+                per_sample_elems = y_true.shape[1]
+
+            # Acumular
             batch_size = y_true.shape[0]
             total_samples += batch_size
+            total_mse     += ((y_true - y_pred)**2).sum()
+            total_mae     += np.abs(y_true - y_pred).sum()
 
-            # MSE sumado
-            total_mse += ((y_true - y_pred)**2).sum()
-            # MAE sumado
-            total_mae += abs(y_true - y_pred).sum()
+    # Ahora sí podemos calcular promedios correctamente
+    num_elements = total_samples * per_sample_elems
+    mse = total_mse / num_elements
+    mae = total_mae / num_elements
 
-            # liberamos cuanto antes
-            del x_batch, out, y_true, y_pred
-            torch.cuda.empty_cache()
-            import gc; gc.collect()
-
-    mse = total_mse / (total_samples * loader.dataset[0][0].numel())
-    mae = total_mae / (total_samples * loader.dataset[0][0].numel())
     return {'mse': mse, 'mae': mae}
 
 
-# Guardar en archivo
-#script_path = Path("/mnt/data/evaluate_autoencoder.py")
-#script_path.write_text(inspect.getsource(evaluate_autoencoder))
-#script_path.write_text(inspect.getsource(evaluate_autoencoder), encoding='utf-8')
-
-#print(f"Script guardado en: {script_path}")
-
-#str(file_path)
-
 def evaluate_and_detect(model, test_loader):
+    """
+    Evalúa un autoencoder y detecta anomalías basándose en la reconstrucción.
+        
+    """
     model.eval()
     losses = []
     with torch.no_grad():
