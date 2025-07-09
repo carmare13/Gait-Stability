@@ -17,7 +17,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 import torch.nn.functional as F
 from pathlib import Path
 import inspect
-import time 
+import time
 import psutil
 
 # ─── Seeds ─────────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ torch.backends.cudnn.benchmark = False
 
 
 # ─── Configuración ──────────────────────────────────────────────────────
-n_timesteps= 100 #cycle is normalized to 100 points 
+n_timesteps= 100 #cycle is normalized to 100 points
 
 # ─── Device ────────────────────────────────────────────────────────────
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -78,20 +78,20 @@ class GaitBatchIterable(IterableDataset):
             feat_np = data[:, :, :321]              # (bs, 100, 321)
             feat    = torch.from_numpy(feat_np).float()
             # —— aquí permutamos para (bs, 321, 100):
-            feat = feat.permute(0, 2, 1)
+            #feat = feat.permute(0, 2, 1)
 
             if self.return_meta:
                 meta_np = data[:, :, 321:]          # (bs, 100, 5)
                 meta    = torch.from_numpy(meta_np).float()
                 # opcional: permutar meta también si quieres (bs, 5, 100)
-                meta = meta.permute(0, 2, 1)
+                #meta = meta.permute(0, 2, 1)
                 yield feat, meta
             else:
                 yield feat, feat
 
 # ─── 2. Model Definitions ────────────────────────────────────────────────
 class LSTMAutoencoder(nn.Module):
-    def __init__(self, n_timesteps, n_vars, latent_dim, dropout=0.2):
+    def __init__(self, n_timesteps, n_vars, latent_dim, dropout=0.4):
         super().__init__()
         self.n_timesteps = n_timesteps
 
@@ -99,7 +99,7 @@ class LSTMAutoencoder(nn.Module):
                                batch_first=True)
         self.decoder = nn.LSTM(input_size=latent_dim, hidden_size=latent_dim,
                                batch_first=True)
-        
+
         self.hidden_layer = nn.Linear(latent_dim, latent_dim)
         self.dropout = nn.Dropout(dropout)
         self.output_layer = nn.Linear(latent_dim, n_vars)
@@ -136,37 +136,38 @@ class LSTMAutoencoder(nn.Module):
                     nn.init.zeros_(param)
 
 class BiLSTMAutoencoder(nn.Module):
-    def __init__(self, n_timesteps, n_vars, latent_dim, dropout=0.2):
+    def __init__(self, n_timesteps, n_vars, latent_dim, dropout=0.4):
         super().__init__()
         self.n_timesteps = n_timesteps
-        
+        self.latent_dim = latent_dim
+
         # Encoder bidireccional
         self.encoder = nn.LSTM(input_size=n_vars, hidden_size=latent_dim,
                                batch_first=True, bidirectional=True)
         # Bottleneck para reducir 2*latent_dim → latent_dim
         self.bottleneck = nn.Linear(2 * latent_dim, latent_dim)
-        
+
         # Decoder bidireccional
         self.decoder = nn.LSTM(input_size=latent_dim, hidden_size=latent_dim,
                                batch_first=True, bidirectional=True)
         self.norm = nn.LayerNorm(2 * latent_dim)
-        
+
         # Capa oculta y dropout (trabajan sobre 2*latent_dim)
         self.hidden_layer = nn.Linear(2 * latent_dim, 2 * latent_dim)
         self.dropout = nn.Dropout(dropout)
-        
+
         # Capa de salida
         self.output_layer = nn.Linear(2 * latent_dim, n_vars)
 
         self.apply(self.init_weights)
-    
+
     def encode(self, x):
         """
         Devuelve el vector latente z para cada muestra de x.
         """
         enc_out, _ = self.encoder(x)             # (batch, seq, 2*latent_dim)
-        h_forward = enc_out[:, -1, :latent_dim]
-        h_backward = enc_out[:, 0, latent_dim:]
+        h_forward = enc_out[:, -1, :self.latent_dim]
+        h_backward = enc_out[:, 0, self.latent_dim:]
         last = torch.cat([h_forward, h_backward], dim=1)           # (batch, 2*latent_dim)
         z       = self.bottleneck(last)         # (batch, latent_dim)
         return z
@@ -179,11 +180,11 @@ class BiLSTMAutoencoder(nn.Module):
         z_rep = z.unsqueeze(1).repeat(1, self.n_timesteps, 1)
         dec_out, _ = self.decoder(z_rep)         # (batch, seq, 2*latent_dim)
         dec_out = self.norm(dec_out)      # LayerNorm aplicada
-        
+
         # Capa oculta + activación + dropout
         h = torch.tanh(self.hidden_layer(dec_out))   # (batch, seq, 2*latent_dim)
         h = self.dropout(h)
-        
+
         # Capa final de reconstrucción
         out = self.output_layer(h)               # (batch, seq, vars)
         return out
@@ -192,7 +193,7 @@ class BiLSTMAutoencoder(nn.Module):
         z = self.encode(x)
         out = self.decode(z)
         return (out, z) if return_z else out
-    
+
     def init_weights(self, m):
         if isinstance(m, nn.Linear):
             nn.init.xavier_uniform_(m.weight)
@@ -204,7 +205,7 @@ class BiLSTMAutoencoder(nn.Module):
                     nn.init.xavier_uniform_(param)
                 elif "bias" in name:
                     nn.init.zeros_(param)
-    
+
 class GaitAutoencoder(nn.Module):
     def __init__(self, input_channels, seq_length, latent_dim):
         super().__init__()
@@ -239,8 +240,8 @@ class GaitAutoencoder(nn.Module):
 
     def forward(self, x):
         # x: (batch, 321, 100)
-        x_enc = self.encoder_conv(x)            
-        flat  = x_enc.view(x_enc.size(0), -1)    
+        x_enc = self.encoder_conv(x)
+        flat  = x_enc.view(x_enc.size(0), -1)
         z     = self.encoder_fc(flat)            # (batch, latent_dim)
 
         up    = self.decoder_fc(z)               # (batch, flat_dim)
@@ -249,22 +250,104 @@ class GaitAutoencoder(nn.Module):
         return x_recon, z
 
 
-    
+class LSTMConvAutoencoder(nn.Module):
+    def __init__(self, input_dim, latent_dim, n_timesteps, dropout=0.4):
+        super().__init__()
+        self.n_timesteps = n_timesteps
+
+        # Encoder: capas convolucionales
+        self.conv1 = nn.Conv1d(input_dim, 64, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=3, stride=1, padding=1)
+
+        # LSTM para capturar dependencias temporales
+        self.lstm = nn.LSTM(128, latent_dim, batch_first=True)
+
+        # Decoder: LSTM + convoluciones
+        self.decoder_lstm = nn.LSTM(latent_dim, 128, batch_first=True)
+
+        # No necesitamos una capa lineal para ajustar la salida de LSTM
+        # El tamaño de la salida del LSTM (latent_dim) ya es compatible con el decoder LSTM
+
+        self.deconv1 = nn.Conv1d(128, 64, kernel_size=3, stride=1, padding=1)
+        self.deconv2 = nn.Conv1d(64, input_dim, kernel_size=3, stride=1, padding=1)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def encode(self, x):
+        x = x.permute(0, 2, 1)  # Cambiar el formato a (batch, n_channels, n_timesteps)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = x.permute(0, 2, 1)  # Volver a la forma original (batch, seq_len, features)
+        _, (h_n, _) = self.lstm(x)
+        return h_n.squeeze(0)
+
+    def decode(self, z):
+        # Repetir el vector latente z para cada timestep
+        z_rep = z.unsqueeze(1).repeat(1, self.n_timesteps, 1)
+
+        # Salida del decoder LSTM
+        dec_out, _ = self.decoder_lstm(z_rep)
+
+        # --- INICIO DE LA CORRECCIÓN ---
+
+        # Permutar de (batch, seq_len, features) a (batch, features, seq_len)
+        # para que sea compatible con Conv1d
+        dec_out = dec_out.permute(0, 2, 1)
+
+        # Aplicar las deconvoluciones
+        dec_out = F.relu(self.deconv1(dec_out))
+        dec_out = self.deconv2(dec_out)
+
+        # Permutar de vuelta al formato original (batch, seq_len, features)
+        # para que coincida con la forma del tensor de entrada 'x'
+        dec_out = dec_out.permute(0, 2, 1)
+
+        # --- FIN DE LA CORRECCIÓN ---
+
+        return dec_out
+
+    # def decode(self, z):
+    #     # Ahora la salida del LSTM tiene el tamaño esperado de latent_dim
+    #     z_rep = z.unsqueeze(1).repeat(1, self.n_timesteps, 1)  # Repetir z para cada timestep
+    #     dec_out, _ = self.decoder_lstm(z_rep)  # El tamaño de z es latent_dim, que es 256
+    #     dec_out = F.relu(self.deconv1(dec_out))
+    #     dec_out = self.deconv2(dec_out)
+    #     return dec_out
+
+    def forward(self, x, return_z=False):
+        z = self.encode(x)
+        recon = self.decode(z)
+        return (recon, z) if return_z else recon
+
+
+
+
+
+
+
 # ─── 3. Training ────────────────────────────────────────────────────────
+# def contrastive_loss(x1, x2, label, margin=1.0):
+#     # Distancia euclidiana entre las representaciones latentes
+#     euclidean_distance = F.pairwise_distance(x1, x2, keepdim=True)
+#     loss_contrastive = torch.mean((1 - label) * torch.pow(euclidean_distance, 2) +
+#                                   (label) * torch.pow(torch.clamp(margin - euclidean_distance, min=0.0), 2))
+#     return loss_contrastive
+
+
 def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
                       model_dir='saved_models', log_dir='logs',
-                      lr_initial=1e-4, lr_decay_rate=0.98, lr_decay_steps=5000,
+                      lr_initial=1e-3, lr_decay_rate=0.98, lr_decay_steps=5000,
                       clip_norm=1.0, patience=5, return_history: bool = False,
                       debug: bool = False,
                       debug_batches: int = 10):
-    
+
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
     model.to(device)
 
     writer = SummaryWriter(f"{log_dir}/{run_id}")
     scaler = GradScaler()
-    optimizer = optim.AdamW(model.parameters(), lr=lr_initial, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=lr_initial, weight_decay=5e-4)
     scheduler = optim.lr_scheduler.LambdaLR(
         optimizer,
         lr_lambda=lambda step: lr_decay_rate ** (step // lr_decay_steps)
@@ -278,7 +361,7 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
     for epoch in range(1, epochs+1):
         model.train()
         train_loss = 0.0
-        
+
 
         if debug:
             torch.cuda.reset_peak_memory_stats()
@@ -293,6 +376,22 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
             if debug:
                 torch.cuda.synchronize(device)    # aseguramos que la copia termine
                 t2 = time.perf_counter()
+
+             # Dentro del ciclo de entrenamiento
+            # optimizer.zero_grad()
+            # with autocast(device_type=device.type):
+            #     recon, z = model(x, return_z=True)
+
+            #     # Pérdida de reconstrucción (mse) + pérdida contrastiva
+            #     loss_mse = F.mse_loss(recon, x)
+            #     loss_contrastive = contrastive_loss(z, z_anchor, label)  # Calcula la pérdida contrastiva entre pares de ciclos
+
+            #     # Total loss = mse + contrastive loss
+            #     loss = loss_mse + loss_contrastive
+            #     loss.backward()
+            #     optimizer.step()
+
+
 
             optimizer.zero_grad()
             with autocast(device_type=device.type):
@@ -313,10 +412,10 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
                 torch.cuda.synchronize(device)
                 t3 = time.perf_counter()
 
-                # —— medición de memoria GPU —— 
+                # —— medición de memoria GPU ——
                 used = torch.cuda.memory_allocated(device)           # bytes actuales
                 peak = torch.cuda.max_memory_allocated(device)       # bytes pico
-                # —— medición de memoria CPU —— 
+                # —— medición de memoria CPU ——
                 mem = process.memory_info().rss                       # RSS en bytes
 
                 print(
@@ -333,7 +432,7 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
         writer.add_scalar('Loss/train', train_loss, epoch)
         train_hist.append(train_loss)
 
-        # —— guarda estadísticas de memoria por época —— 
+        # —— guarda estadísticas de memoria por época ——
         if debug:
             epoch_gpu_peak = torch.cuda.max_memory_allocated(device)
             epoch_cpu_rss = process.memory_info().rss
@@ -365,7 +464,7 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
                 print(f"Early stopping at epoch {epoch}")
-                break    
+                break
 
     final_path = f"{model_dir}/ae_lstm_{run_id}.pth"
     torch.save(model.state_dict(), final_path)
@@ -427,7 +526,7 @@ def evaluate_autoencoder_streaming(model, loader, device):
     total_mse = 0.0
     total_mae = 0.0
     total_samples = 0
-    per_sample_elems = None   
+    per_sample_elems = None
 
     with torch.no_grad():
         for batch in loader:
@@ -464,7 +563,7 @@ def evaluate_autoencoder_streaming(model, loader, device):
 def evaluate_and_detect(model, test_loader):
     """
     Evalúa un autoencoder y detecta anomalías basándose en la reconstrucción.
-        
+
     """
     model.eval()
     losses = []
