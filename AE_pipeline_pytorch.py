@@ -89,6 +89,204 @@ class GaitBatchIterable(IterableDataset):
             else:
                 yield feat, feat
 
+
+# ---- Blocks -----------------
+class GradientReversalFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambd): 
+        ctx.lambd = lambd
+        return x.view_as(x)
+    @staticmethod
+    def backward(ctx, grad_output): 
+        return -ctx.lambd * grad_output, None
+
+class GRL(nn.Module):
+    def __init__(self, lambd=1.0): 
+        super().__init__(); self.lambd = lambd
+    def forward(self, x):
+        return GradientReversalFn.apply(x, self.lambd)
+    
+
+class BiLSTMEncoder(nn.Module):
+    def __init__(self, in_dim=321, hidden=128, latent=128):
+        super().__init__()
+        self.bilstm = nn.LSTM(input_size=in_dim, hidden_size=hidden,
+                              num_layers=1, batch_first=True, bidirectional=True)
+        self.to_latent = nn.Sequential(
+            nn.Linear(2*hidden, latent),
+            nn.LayerNorm(latent)
+        )
+    def forward(self, x):  # x: [B, 100, 321]
+        h, _ = self.bilstm(x)         # [B, 100, 256]
+        h_last = h[:, -1, :]          # take last timestep  [B, 256]
+        z = self.to_latent(h_last)    # [B, 128]
+        return z
+
+class LSTMDecoder(nn.Module):
+    def __init__(self, out_dim=321, hidden=128, steps=100, latent=128):
+        super().__init__()
+        self.steps = steps
+        self.init = nn.Linear(latent, hidden)
+        self.lstm = nn.LSTM(input_size=hidden, hidden_size=hidden,
+                            num_layers=1, batch_first=True)
+        self.out = nn.Linear(hidden, out_dim)
+    def forward(self, z):  # z: [B, 128]
+        B = z.size(0)
+        h0 = torch.tanh(self.init(z))          # [B, 128]
+        seq = h0.unsqueeze(1).repeat(1, self.steps, 1)  # teacher-free decoding
+        y, _ = self.lstm(seq)                  # [B, 100, 128]
+        y = self.out(y)                        # [B, 100, 321]
+        return y
+
+class HeadMLP(nn.Module):
+    def __init__(self, in_dim, hidden, out_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, out_dim)
+        )
+    def forward(self, x): return self.net(x)
+
+class ProjectionHead(nn.Module):
+    def __init__(self, in_dim=128, proj_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, proj_dim),
+            nn.ReLU(),
+            nn.Linear(proj_dim, proj_dim)
+        )
+    def forward(self, x): return F.normalize(self.net(x), dim=-1)
+
+# ---------- Full model ----------
+class SemiSupAE(nn.Module):
+    def __init__(self, steps=100, in_dim=321, latent=128,
+                 n_group=2, n_nuisance=None, grl_lambda=1.0):
+        super().__init__()
+        self.encoder = BiLSTMEncoder(in_dim=in_dim, latent=latent)
+        self.decoder = LSTMDecoder(out_dim=in_dim, steps=steps, latent=latent)
+        self.group_head = HeadMLP(latent, 64, n_group)
+        self.proj_head  = ProjectionHead(latent, 128)
+        self.use_nuis = n_nuisance is not None
+        if self.use_nuis:
+            self.grl = GRL(lambd=grl_lambda)
+            self.nuis_head = HeadMLP(latent, 64, n_nuisance)
+
+    def forward(self, x, return_all=False):
+        z = self.encoder(x)             # [B,128]
+        y_hat = self.decoder(z)         # [B,100,321]
+        logits = self.group_head(z)     # [B,2]
+        proj = self.proj_head(z)        # [B,128]
+        out = {"z": z, "recon": y_hat, "logits": logits, "proj": proj}
+        if self.use_nuis:
+            nuis_logits = self.nuis_head(self.grl(z))
+            out["nuis_logits"] = nuis_logits
+        return out if return_all else (y_hat, logits)
+
+# ---------- Losses ----------
+def supcon_loss(emb, labels, temperature=0.07):
+    # emb: [B, D] normalized; labels: [B] patient_id
+    # Simple supervised contrastive (NT-Xent style)
+    sim = torch.matmul(emb, emb.t()) / temperature
+    labels = labels.contiguous().view(-1, 1)
+    mask = torch.eq(labels, labels.t()).float()
+    logits_mask = torch.ones_like(mask) - torch.eye(mask.size(0), device=mask.device)
+    mask = mask * logits_mask
+    # log-softmax over rows
+    log_prob = sim - torch.logsumexp(sim + torch.log(logits_mask + 1e-12), dim=1, keepdim=True)
+    mean_log_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-12)
+    return -mean_log_pos.mean()
+
+def consistency_loss(student_logits, teacher_logits):
+    # MSE on probabilities (you can also use KL)
+    ps = F.softmax(student_logits, dim=-1)
+    pt = F.softmax(teacher_logits.detach(), dim=-1)
+    return F.mse_loss(ps, pt)
+
+# ---------- EMA teacher ----------
+class EMATeacher(nn.Module):
+    def __init__(self, student, ema=0.99):
+        super().__init__()
+        self.teacher = SemiSupAE(**student.__dict__['_modules'])  # shallow copy shape
+        self.ema = ema
+        self.update(student, init=True)
+        for p in self.teacher.parameters(): p.requires_grad = False
+    @torch.no_grad()
+    def update(self, student, init=False):
+        ts, ss = self.teacher.state_dict(), student.state_dict()
+        for k in ts.keys():
+            ts[k] = ss[k] if init else self.ema*ts[k] + (1-self.ema)*ss[k]
+        self.teacher.load_state_dict(ts)
+
+# ---------- Training loop sketch ----------
+def train_step(batch, model, teacher, optimizer, weights,
+               augment_fn, pseudo_thresh=0.9):
+    """
+    batch: dict with
+      x: [B,100,321], y_group: [B] (may be -1 for unlabeled),
+      patient_id: [B], nuis_label: [B] (optional)
+    """
+    model.train()
+    x = batch['x']
+    y_group = batch['y_group']          # -1 == unlabeled
+    pid = batch['patient_id']
+    nuis = batch.get('nuis', None)
+
+    # Augment for consistency
+    x_strong = augment_fn(x)
+    out_s = model(x, return_all=True)
+    out_s_strong = model(x_strong, return_all=True)
+
+    # Teacher forward (no grad)
+    with torch.no_grad():
+        out_t = teacher.teacher(x, return_all=True)
+
+    # Loss: reconstruction
+    L_rec = F.mse_loss(out_s['recon'], x)
+
+    # Supervised group CE on labeled subset
+    labeled_mask = (y_group >= 0)
+    L_group = torch.tensor(0.0, device=x.device)
+    if labeled_mask.any():
+        L_group = F.cross_entropy(out_s['logits'][labeled_mask], y_group[labeled_mask])
+
+    # Pseudo-labels on unlabeled
+    unl_mask = ~labeled_mask
+    if unl_mask.any():
+        probs = F.softmax(out_t['logits'][unl_mask], dim=-1)
+        conf, pseudo = probs.max(-1)
+        sel = conf >= pseudo_thresh
+        if sel.any():
+            L_pseudo = F.cross_entropy(out_s['logits'][unl_mask][sel], pseudo[sel])
+            L_group = L_group + weights['pseudo_w'] * L_pseudo
+
+    # Consistency (student strong vs teacher)
+    L_cons = consistency_loss(out_s_strong['logits'], out_t['logits'])
+
+    # SupCon with patient identity
+    L_supcon = supcon_loss(out_s['proj'], pid)
+
+    # Adversarial invariance to nuisance (if available)
+    L_adv = torch.tensor(0.0, device=x.device)
+    if nuis is not None and model.use_nuis:
+        L_adv = F.cross_entropy(out_s['nuis_logits'], nuis)
+
+    # Total
+    L = (weights['rec']*L_rec + weights['group']*L_group +
+         weights['supcon']*L_supcon + weights['cons']*L_cons +
+         weights['adv']*L_adv)
+
+    optimizer.zero_grad()
+    L.backward()
+    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    teacher.update(model)
+
+    return { "loss": L.item(), "rec": L_rec.item(),
+             "group": L_group.item() if isinstance(L_group, torch.Tensor) else L_group,
+             "supcon": L_supcon.item(), "cons": L_cons.item(),
+             "adv": L_adv.item() if isinstance(L_adv, torch.Tensor) else L_adv }
+
+
 # ─── 2. Model Definitions ────────────────────────────────────────────────
 class LSTMAutoencoder(nn.Module):
     def __init__(self, n_timesteps, n_vars, latent_dim, dropout=0.4):

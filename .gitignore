@@ -19,5 +19,6 @@ train_cycles.zarr
 val_cycles.zarr
 Data_Split
 Results AE
+git-2.46.0
 
 __pycache__/
