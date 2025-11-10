@@ -13,9 +13,10 @@ trials = ["T01", "T02", "T03"]
 
 # mapping of group code to its base folder
 #project_root = os.path.dirname(os.path.abspath(__file__))
-project_root = "/mnt/storage/dmartinez" #Now the database is in the server
+project_root = "/mnt/storage/dmartinez/Gait-Stability" #Now the database is in the server
 base_folders = {
     "G01": os.path.join(project_root, "young adults (19–35 years old)"),
+    "G02": os.path.join(project_root, "Middle Age Adults"),
     "G03": os.path.join(project_root, "old adults (56+ years old)")
 }
 
@@ -165,3 +166,4 @@ def get_all_npy_paths_by_group(subjects_dict, base_folders_map):
                 else:
                     print(f"Warning: missing file {full_path}")
     return paths
+

@@ -896,7 +896,8 @@ def preprocess_all_groups_and_patients(
     num_kinematic_variables: int,
     global_scaler,
     subfolder_name: str = "preprocessed",
-    verbose: bool = False
+    verbose: bool = False,
+    groups_to_process: list[str] | None = None,
 ):
     """
     Applies save_patient_preprocessed_tensors to every patient in every group,
@@ -910,6 +911,8 @@ def preprocess_all_groups_and_patients(
         verbose: Print progress.
     """
     for group_code, group_path in base_folders.items():
+        if groups_to_process is not None and group_code not in groups_to_process:
+            continue
         if verbose:
             print(f"\n[INFO] Processing group: {group_code}")
         patient_ids = [d for d in os.listdir(group_path)

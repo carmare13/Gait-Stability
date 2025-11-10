@@ -20,5 +20,10 @@ val_cycles.zarr
 Data_Split
 Results AE
 git-2.46.0
+runs
+old adults (56+ years old)
+young adults (19–35 years old)
+Middle Age Adults
+checkpoints
 
 __pycache__/

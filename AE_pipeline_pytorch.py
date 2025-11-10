@@ -4,6 +4,7 @@ import json
 from tqdm import tqdm
 from typing import Dict, List
 
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -25,69 +26,145 @@ os.environ['PYTHONHASHSEED'] = '0'
 random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)
-torch.cuda.manual_seed_all(42)
+if torch.cuda.is_available():
+    try:
+        torch.cuda.manual_seed_all(42)
+    except Exception:
+        pass
 
 # ─── Configuración de cuDNN ─────────────────────────────────────────────
 # Garantizar reproducibilidad en cuDNN
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+if torch.backends.cudnn.is_available():
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 # ─── Configuración ──────────────────────────────────────────────────────
 n_timesteps= 100 #cycle is normalized to 100 points
 
 # ─── Device ────────────────────────────────────────────────────────────
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def get_device():
+    # Si exportas USE_GPU=0, vas en CPU aunque haya GPU
+    use_gpu = os.environ.get("USE_GPU", "1") == "1"
+    if use_gpu and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+device = get_device()
 print(f"Using device: {device}")
 
 
+
 # ─── 1. Dataset ─────────────────────────────────────────────────────────
+# class GaitBatchIterable(IterableDataset):
+#     def __init__(self, store_path, batch_size, return_meta=False):
+#         self._z = zarr.open(store_path, mode="r")["data"]
+#         self.bs = batch_size
+#         self.return_meta = return_meta
+#         self.n = len(self._z)
+
+#     def __len__(self):
+#         return self.n // self.bs
+
+#     def __iter__(self):
+#         worker_info = get_worker_info()
+#         rng = np.random.default_rng(worker_info.id if worker_info else None)
+
+#         all_batch_start_idxs = np.arange(0, self.n, self.bs)
+#         rng.shuffle(all_batch_start_idxs)
+
+#         if worker_info:
+#             worker_id = worker_info.id
+#             num_workers = worker_info.num_workers
+#             total_batches = len(all_batch_start_idxs)
+#             per_worker = total_batches // num_workers
+#             rem = total_batches % num_workers
+
+#             start = worker_id * per_worker + min(worker_id, rem)
+#             end   = start + per_worker + (1 if worker_id < rem else 0)
+#             batch_starts = all_batch_start_idxs[start:end]
+#         else:
+#             batch_starts = all_batch_start_idxs
+
+#         for s in batch_starts:
+#             batch_idxs = np.arange(s, min(s + self.bs, self.n))
+#             data = self._z[batch_idxs]              # (bs, 100, 326)
+#             feat_np = data[:, :, :321]              # (bs, 100, 321)
+#             feat    = torch.from_numpy(feat_np).float()
+#             # —— aquí permutamos para (bs, 321, 100):
+#             #feat = feat.permute(0, 2, 1)
+
+#             if self.return_meta:
+#                 meta_np = data[:, :, 321:]          # (bs, 100, 5)
+#                 meta    = torch.from_numpy(meta_np).float()
+#                 # opcional: permutar meta también si quieres (bs, 5, 100)
+#                 #meta = meta.permute(0, 2, 1)
+#                 yield feat, meta
+#             else:
+#                 yield feat, feat
+
 class GaitBatchIterable(IterableDataset):
     def __init__(self, store_path, batch_size, return_meta=False):
-        self._z = zarr.open(store_path, mode="r")["data"]
+        self.store_path = store_path
         self.bs = batch_size
         self.return_meta = return_meta
-        self.n = len(self._z)
-
-    def __len__(self):
-        return self.n // self.bs
 
     def __iter__(self):
+        import os, numpy as np, torch, zarr
+        from torch.utils.data import get_worker_info
+
+        # Limitar hilos (mitiga rarezas de blosc/OpenMP)
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        try:
+            import numcodecs.blosc as nblosc
+            nblosc.set_nthreads(1)
+        except Exception:
+            pass
+
+        # Abrir Zarr (consolidado si existe)
+        try:
+            grp = zarr.open_consolidated(self.store_path, mode="r")
+            z = grp["data"]
+        except Exception:
+            z = zarr.open(self.store_path, mode="r")["data"]
+
+        n = len(z)
+
         worker_info = get_worker_info()
         rng = np.random.default_rng(worker_info.id if worker_info else None)
 
-        all_batch_start_idxs = np.arange(0, self.n, self.bs)
-        rng.shuffle(all_batch_start_idxs)
+        batch_starts = np.arange(0, n, self.bs, dtype=np.int64)
+        rng.shuffle(batch_starts)
 
         if worker_info:
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
-            total_batches = len(all_batch_start_idxs)
-            per_worker = total_batches // num_workers
-            rem = total_batches % num_workers
-
-            start = worker_id * per_worker + min(worker_id, rem)
-            end   = start + per_worker + (1 if worker_id < rem else 0)
-            batch_starts = all_batch_start_idxs[start:end]
-        else:
-            batch_starts = all_batch_start_idxs
+            wid, nw = worker_info.id, worker_info.num_workers
+            total = len(batch_starts)
+            per, rem = total // nw, total % nw
+            start = wid * per + min(wid, rem)
+            end = start + per + (1 if wid < rem else 0)
+            batch_starts = batch_starts[start:end]
 
         for s in batch_starts:
-            batch_idxs = np.arange(s, min(s + self.bs, self.n))
-            data = self._z[batch_idxs]              # (bs, 100, 326)
-            feat_np = data[:, :, :321]              # (bs, 100, 321)
-            feat    = torch.from_numpy(feat_np).float()
-            # —— aquí permutamos para (bs, 321, 100):
-            #feat = feat.permute(0, 2, 1)
+            lo = int(s)
+            hi = int(min(s + self.bs, n))
 
+            # Slicing contiguo (evita fancy indexing)
+            data = z[lo:hi].astype("float32", copy=True)   # COPIA SEGURA
+
+            # Split features / meta
+            feat_np = data[:, :, :321]
             if self.return_meta:
-                meta_np = data[:, :, 321:]          # (bs, 100, 5)
-                meta    = torch.from_numpy(meta_np).float()
-                # opcional: permutar meta también si quieres (bs, 5, 100)
-                #meta = meta.permute(0, 2, 1)
+                meta_np = data[:, :, 321:]
+                # Conversión con copia explícita a tensor (más seguro que from_numpy)
+                feat = torch.tensor(feat_np, dtype=torch.float32)
+                meta = torch.tensor(meta_np, dtype=torch.float32)
                 yield feat, meta
             else:
+                feat = torch.tensor(feat_np, dtype=torch.float32)
                 yield feat, feat
+
+
+
 
 
 # ---- Blocks -----------------
@@ -206,7 +283,9 @@ def consistency_loss(student_logits, teacher_logits):
 class EMATeacher(nn.Module):
     def __init__(self, student, ema=0.99):
         super().__init__()
-        self.teacher = SemiSupAE(**student.__dict__['_modules'])  # shallow copy shape
+        import copy
+        self.teacher = copy.deepcopy(student)
+        for p in self.teacher.parameters(): p.requires_grad = False
         self.ema = ema
         self.update(student, init=True)
         for p in self.teacher.parameters(): p.requires_grad = False
@@ -561,7 +640,7 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
         train_loss = 0.0
 
 
-        if debug:
+        if debug and device.type == 'cuda':
             torch.cuda.reset_peak_memory_stats()
             t0 = time.perf_counter()
 
@@ -571,7 +650,7 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
 
             x = x.to(device, non_blocking=True)
 
-            if debug:
+            if debug and device.type == 'cuda':
                 torch.cuda.synchronize(device)    # aseguramos que la copia termine
                 t2 = time.perf_counter()
 
@@ -606,7 +685,7 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
 
             train_loss += loss.item()
 
-            if debug:
+            if debug and device.type == 'cuda':
                 torch.cuda.synchronize(device)
                 t3 = time.perf_counter()
 
@@ -631,11 +710,13 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
         train_hist.append(train_loss)
 
         # —— guarda estadísticas de memoria por época ——
-        if debug:
+        if debug and device.type == 'cuda':
             epoch_gpu_peak = torch.cuda.max_memory_allocated(device)
-            epoch_cpu_rss = process.memory_info().rss
             writer.add_scalar('Mem/GPU_peak_GB', epoch_gpu_peak/1e9, epoch)
-            writer.add_scalar('Mem/CPU_RSS_GB', epoch_cpu_rss/1e9, epoch)
+            
+        # CPU RSS 
+        epoch_cpu_rss = process.memory_info().rss    
+        writer.add_scalar('Mem/CPU_RSS_GB', epoch_cpu_rss/1e9, epoch)
 
         # Validación
         model.eval()
@@ -644,8 +725,9 @@ def train_autoencoder(model, train_loader, val_loader, run_id, epochs,
             for x_val, _ in val_loader:
                 x_val = x_val.to(device, non_blocking=True)
                 with autocast(device_type=device.type):
-                    recon_val = model(x_val)
-                    loss_val = F.mse_loss(recon_val, x_val)
+                    out_val = model(x_val)  # puede ser tensor o tupla (recon, z)
+                recon_val = out_val[0] if isinstance(out_val, tuple) else out_val
+                loss_val = F.mse_loss(recon_val, x_val)
                 val_loss += loss_val.item()
         val_loss /= len(val_loader)
         writer.add_scalar('Loss/val', val_loss, epoch)
@@ -694,9 +776,9 @@ def evaluate_autoencoder(model, data_loader, device="cpu"):
     with torch.no_grad():
         for x_batch, _ in data_loader:
             x_batch = x_batch.to(device)
-            output = model(x_batch)
-
-            predictions.append(output.cpu())
+            out = model(x_batch)
+            recon = out[0] if isinstance(out, tuple) else out
+            predictions.append(recon.cpu())
             targets.append(x_batch.cpu())
 
     # Convertir a numpy y a forma plana
@@ -775,7 +857,8 @@ def evaluate_and_detect(model, test_loader):
             # Asegurarse de que x está en GPU/CPU según corresponda
             x = x.to(device, non_blocking=True)
             with autocast(device_type=device.type):
-                recon = model(x)
+                out = model(x)
+            recon = out[0] if isinstance(out, tuple) else out
             # reconstrucción vs original
             batch_losses = ((recon - x) ** 2).mean(dim=(1, 2)).cpu().numpy()
             losses.append(batch_losses)
