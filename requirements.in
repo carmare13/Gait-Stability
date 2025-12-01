@@ -1,0 +1,39 @@
+# --- Numeric / scientific core ---
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+seaborn
+numba
+numexpr
+Bottleneck
+sympy
+zarr
+numcodecs
+blosc
+
+# --- ML / embeddings / clustering / dimensionality reduction ---
+torch
+torchvision
+torchaudio
+tensorboard
+hdbscan
+umap-learn
+pynndescent
+
+# --- General utilities ---
+requests
+tqdm
+joblib
+PyYAML
+
+# --- Extra visualization / dashboards ---
+plotly
+
+# --- GUI / Qt ---
+PyQt6
+
+# --- XAI ---
+xgboost
+shap 

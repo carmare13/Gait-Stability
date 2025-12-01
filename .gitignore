@@ -28,3 +28,6 @@ checkpoints
 checkpoints_3groups
 
 __pycache__/
+
+gmm_labels.npy
+HDBSCAN_labels.npy
