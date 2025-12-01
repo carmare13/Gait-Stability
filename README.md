@@ -1,42 +1,184 @@
 # Gait Stability Assessment Using Nonlinear Analysis and Artificial Intelligence
 
-This repository contains the code, and documentation for a research project focused on developing a methodology to assess gait stability by integrating nonlinear analysis techniques and artificial intelligence (AI).
+This repository contains the code, data structure, and documentation for a research project aimed at quantifying gait stability using nonlinear dynamics, dimensionality reduction with deep learning, and unsupervised analysis of full-body IMU gait data collected on a 200-meter curved indoor track.
+
+The project extends the ideas presented in recent nonlinear gait analysis literature—particularly the NONAN GaitPrint dataset —by integrating advanced machine learning models to extract stable, subject-invariant and pathology-sensitive gait representations.
 
 ## Project Overview
 
-Gait stability is a critical factor in reducing fall risk. Current methodologies often lack a comprehensive approach to capturing the complexity of human movement. This project aims to close that gap by combining:
+Gait stability is essential for predicting fall risk and identifying early motor decline. Traditional gait metrics (step length, cadence, stride time, etc.) capture only linear aspects of movement. However, human gait is inherently nonlinear, exhibiting:
 
-- **Nonlinear Analysis:** Techniques like Lyapunov exponents, recurrence quantification analysis, entropy measures, and fractal dynamics to characterize gait variability and stability.
-- **Artificial Intelligence:** To identify key observation variables and predict fall risk.
-- **Biomechanical Data:** A unique dataset with spatiotemporal information from full-body markers 
+Long-range correlations (fractal dynamics)
+
+Dynamical stability (Lyapunov exponents)
+
+Recurrence structures
+
+Attractor-like behavior in joint/segment trajectories
+
+This project provides a modern pipeline combining:
+
+🔹 Nonlinear Analysis
+
+Largest Lyapunov Exponent (λ₁)
+
+Hurst exponent (HfGn)
+
+Recurrence Quantification Analysis (RQA)
+
+Sample entropy & multiscale entropy
+
+Variability structure of spatiotemporal parameters
+
+🔹 Deep Learning & Representation Learning
+
+LSTM-Autoencoder
+
+BiLSTM-Autoencoder
+
+ConvLSTM-Autoencoder
+
+Semi-supervised AE with multiple losses:
+
+reconstruction
+
+supervised contrastive loss
+
+group classification loss (optional)
+
+consistency regularization
+
+EMA-teacher
+
+🔹 Unsupervised Learning
+
+HDBSCAN clustering in latent space
+
+UMAP for manifold visualization
+
+Cluster purity, ARI, NMI
+
+🔹 Biomechanical Data
+
+Full-body IMU kinematics
+
+30–60 subjects, three age groups:
+
+G01 – Young adults
+
+G02 – Middle-aged adults
+
+G03 – Older adults
+
+18 four-minute continuous trials per subject
+
+Curved track walking with real-world variability
+
+321 variables per timestamp (acc, vel, pos, orientation, joint angles)
 
 ## Objectives
 
-1. **Data Transformation:** Process and transform the dataset to extract stability indicators using nonlinear analysis techniques.
-2. **Statistical Analysis:** Identify the most significant variables for classifying gait patterns between healthy individuals and prosthesis users.
-3. **AI Model Development:** Build and compare machine learning models to predict fall risk based on the identified variables.
-4. **Model Evaluation:** Validate the AI models’ performance and generalization capabilities with new data.
+Dataset Transformation
+Segment gait cycles, normalize temporally, and extract spatiotemporal and nonlinear stability indicators.
+
+Dimensionality Reduction
+Train deep autoencoders to capture latent structure of gait stability across subjects and groups.
+
+Unsupervised Group Discovery
+Use clustering algorithms to determine whether latent gait structure separates:
+
+age groups
+
+individual gaitprints
+
+stability/impaired patterns
+
+Explainability (XAI)
+Identify which kinematic variables out of the 321 input channels contribute most to:
+
+cluster membership
+
+stability indicators
+
+group separation
+
+Evaluation and Generalization
+Measure reconstruction errors, latent cluster quality, and test–retest reliability.
 
 ## Project Structure
+├── data/                      # Raw/processed IMU gait data (CSV files)
+│   ├── S###/                 # Subject-wise trials (321 columns, 48k rows)
+│   ├── Spatiotemporal/       # Extracted gait parameters
+│   └── Zarr/                 # Compressed dataset for training
+│
+├── notebooks/                # Jupyter notebooks for EDA, modeling, clustering
+│   ├── preprocessing.ipynb
+│   ├── nonlinear_analysis.ipynb
+│   ├── AE_LSTM.ipynb
+│   ├── AE_BiLSTM.ipynb
+│   ├── AE_ConvLSTM.ipynb
+│   └── clustering_umap_hdbscan.ipynb
+│
+├── src/
+│   ├── preprocessing/        # Heel strike detection, cycle segmentation, normalization
+│   ├── nonlinear/            # Lyapunov, RQA, entropy, Hurst exponent
+│   ├── models/               # Autoencoders, losses, training scripts
+│   ├── evaluation/           # Metrics, clustering, purity, ARI, NMI
+│   └── xai/                  # SHAP, integrated gradients, feature attribution
+│
+├── docs/                     # Project documentation and methodological notes
+└── README.md                 # Project overview
 
-```
-├── data                    # Raw and processed datasets
-├── notebooks               # Jupyter notebooks for data analysis and modeling
-├── src                     # Source code for feature extraction, modeling, and evaluation
-│   ├── preprocessing       # Data transformation scripts
-│   ├── analysis            # Nonlinear analysis techniques implementation
-│   ├── models              # AI models and training scripts
-│   └── evaluation          # Model performance evaluation
-├── docs                    # Project documentation
-└── README.md               # Project overview
-```
+Key Features
+✔ Curved Track Walking
 
-## Requirements
+Unlike most public datasets, this project includes walking on a 200-meter indoor curved track, capturing the real-life variability missing from straight-line treadmill data—consistent with concerns raised in NONAN GaitPrint .
 
-- Python 3.8+
-- Libraries: NumPy, Pandas, SciPy, Scikit-learn, TensorFlow/PyTorch, Matplotlib, Seaborn
-- Additional tools: Jupyter Notebook, SolidWorks, Gazebo (for physical simulation)
-``
+✔ Long Continuous Trials
+
+Each trial contains ~48,000 samples, enabling robust nonlinear analysis such as Lyapunov exponents and fractal dynamics.
+
+✔ Test–Retest Reliability
+
+Repeated trials across two days allow measurement of:
+
+intra-individual stability
+
+inter-individual distinctiveness (gaitprint)
+
+✔ Latent Stability Biomarkers
+
+Autoencoders uncover multidimensional gait stability signatures beyond classical linear metrics.
+
+✔ Explainable AI for Biomechanics
+
+SHAP, permutation tests, and gradients identify the most influential kinematic variables for cluster separation.
+
+Requirements
+
+Python 3.10+
+
+## Recommended libraries:
+
+NumPy, Pandas, SciPy
+
+scikit-learn
+
+PyTorch
+
+UMAP, HDBSCAN
+
+Matplotlib, Seaborn
+
+PyWavelets (entropy & fractal metrics)
+
+Optional tools:
+
+JupyterLab
+
+CUDA GPU for AE training
+
+Gazebo/SolidWorks (for simulation modules)
 
 
 
