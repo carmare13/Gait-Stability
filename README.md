@@ -106,28 +106,28 @@ Evaluation and Generalization
 Measure reconstruction errors, latent cluster quality, and test–retest reliability.
 
 ## Project Structure
-├── data/                      # Raw/processed IMU gait data (CSV files)
-│   ├── S###/                 # Subject-wise trials (321 columns, 48k rows)
-│   ├── Spatiotemporal/       # Extracted gait parameters
-│   └── Zarr/                 # Compressed dataset for training
+├── data/
+│ ├── S###/
+│ ├── Spatiotemporal/
+│ └── Zarr/
 │
-├── notebooks/                # Jupyter notebooks for EDA, modeling, clustering
-│   ├── preprocessing.ipynb
-│   ├── nonlinear_analysis.ipynb
-│   ├── AE_LSTM.ipynb
-│   ├── AE_BiLSTM.ipynb
-│   ├── AE_ConvLSTM.ipynb
-│   └── clustering_umap_hdbscan.ipynb
+├── notebooks/
+│ ├── preprocessing.ipynb
+│ ├── nonlinear_analysis.ipynb
+│ ├── AE_LSTM.ipynb
+│ ├── AE_BiLSTM.ipynb
+│ ├── AE_ConvLSTM.ipynb
+│ └── clustering_umap_hdbscan.ipynb
 │
 ├── src/
-│   ├── preprocessing/        # Heel strike detection, cycle segmentation, normalization
-│   ├── nonlinear/            # Lyapunov, RQA, entropy, Hurst exponent
-│   ├── models/               # Autoencoders, losses, training scripts
-│   ├── evaluation/           # Metrics, clustering, purity, ARI, NMI
-│   └── xai/                  # SHAP, integrated gradients, feature attribution
+│ ├── preprocessing/
+│ ├── nonlinear/
+│ ├── models/
+│ ├── evaluation/
+│ └── xai/
 │
-├── docs/                     # Project documentation and methodological notes
-└── README.md                 # Project overview
+├── docs/
+└── README.md
 
 Key Features
 ✔ Curved Track Walking
