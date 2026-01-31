@@ -26,6 +26,9 @@ young adults (19–35 years old)
 Middle Age Adults
 checkpoints
 checkpoints_3groups
+latents_with_meta.npz
+latents.npy
+NoteBooks/02_functional_validation_cycles.ipynb
 
 __pycache__/
 

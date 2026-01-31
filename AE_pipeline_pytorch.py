@@ -113,6 +113,8 @@ print(f"Using device: {device}")
 
 class GaitBatchIterable(IterableDataset):
     def __init__(self, store_path, batch_size, return_meta=False):
+        base = Path(__file__).resolve().parent  # carpeta del AE_pipeline_pytorch.py
+        p = Path(store_path)
         self.store_path = store_path
         self.bs = batch_size
         self.return_meta = return_meta
@@ -136,10 +138,13 @@ class GaitBatchIterable(IterableDataset):
         except Exception:
             z = zarr.open(self.store_path, mode="r")["data"]
 
-        n = len(z)
+        n = int(z.shape[0])
 
         worker_info = get_worker_info()
-        rng = np.random.default_rng(worker_info.id if worker_info else None)
+        seed = (worker_info.seed if worker_info else None)
+        rng = np.random.default_rng(seed)
+
+        #rng = np.random.default_rng(worker_info.id if worker_info else None)
 
         batch_starts = np.arange(0, n, self.bs, dtype=np.int64)
         rng.shuffle(batch_starts)
