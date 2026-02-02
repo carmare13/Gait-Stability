@@ -27,7 +27,15 @@ Middle Age Adults
 checkpoints
 checkpoints_3groups
 
+fNIRs
+Stride_Variability 
+
 __pycache__/
 
 gmm_labels.npy
 HDBSCAN_labels.npy
+
+corr_pearson.npy
+MI_matrix.npy
+X_raw.npy
+redundancy_outputs
