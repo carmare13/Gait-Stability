@@ -29,6 +29,7 @@ checkpoints_3groups
 latents_with_meta.npz
 latents.npy
 NoteBooks/02_functional_validation_cycles.ipynb
+results_nonan
 
 fNIRs
 Stride_Variability 
