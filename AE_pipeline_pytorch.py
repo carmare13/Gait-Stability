@@ -64,60 +64,16 @@ print(f"Using device: {device}")
 
 
 # ─── 1. Dataset ─────────────────────────────────────────────────────────
-# class GaitBatchIterable(IterableDataset):
-#     def __init__(self, store_path, batch_size, return_meta=False):
-#         self._z = zarr.open(store_path, mode="r")["data"]
-#         self.bs = batch_size
-#         self.return_meta = return_meta
-#         self.n = len(self._z)
-
-#     def __len__(self):
-#         return self.n // self.bs
-
-#     def __iter__(self):
-#         worker_info = get_worker_info()
-#         rng = np.random.default_rng(worker_info.id if worker_info else None)
-
-#         all_batch_start_idxs = np.arange(0, self.n, self.bs)
-#         rng.shuffle(all_batch_start_idxs)
-
-#         if worker_info:
-#             worker_id = worker_info.id
-#             num_workers = worker_info.num_workers
-#             total_batches = len(all_batch_start_idxs)
-#             per_worker = total_batches // num_workers
-#             rem = total_batches % num_workers
-
-#             start = worker_id * per_worker + min(worker_id, rem)
-#             end   = start + per_worker + (1 if worker_id < rem else 0)
-#             batch_starts = all_batch_start_idxs[start:end]
-#         else:
-#             batch_starts = all_batch_start_idxs
-
-#         for s in batch_starts:
-#             batch_idxs = np.arange(s, min(s + self.bs, self.n))
-#             data = self._z[batch_idxs]              # (bs, 100, 326)
-#             feat_np = data[:, :, :321]              # (bs, 100, 321)
-#             feat    = torch.from_numpy(feat_np).float()
-#             # —— aquí permutamos para (bs, 321, 100):
-#             #feat = feat.permute(0, 2, 1)
-
-#             if self.return_meta:
-#                 meta_np = data[:, :, 321:]          # (bs, 100, 5)
-#                 meta    = torch.from_numpy(meta_np).float()
-#                 # opcional: permutar meta también si quieres (bs, 5, 100)
-#                 #meta = meta.permute(0, 2, 1)
-#                 yield feat, meta
-#             else:
-#                 yield feat, feat
-
 class GaitBatchIterable(IterableDataset):
-    def __init__(self, store_path, batch_size, return_meta=False):
+    def __init__(self, store_path, batch_size, return_meta=False,
+                 shuffle=False, seed=42):    
         base = Path(__file__).resolve().parent  # carpeta del AE_pipeline_pytorch.py
         p = Path(store_path)
         self.store_path = store_path
         self.bs = batch_size
         self.return_meta = return_meta
+        self.shuffle = shuffle
+        self.seed = seed
 
     def __iter__(self):
         import os, numpy as np, torch, zarr
@@ -141,13 +97,15 @@ class GaitBatchIterable(IterableDataset):
         n = int(z.shape[0])
 
         worker_info = get_worker_info()
-        seed = (worker_info.seed if worker_info else None)
-        rng = np.random.default_rng(seed)
+        base_seed = self.seed
+        if worker_info:
+            base_seed = self.seed + worker_info.id
+        rng = np.random.default_rng(base_seed)
 
-        #rng = np.random.default_rng(worker_info.id if worker_info else None)
 
         batch_starts = np.arange(0, n, self.bs, dtype=np.int64)
-        rng.shuffle(batch_starts)
+        if self.shuffle:
+           rng.shuffle(batch_starts)
 
         if worker_info:
             wid, nw = worker_info.id, worker_info.num_workers
@@ -166,16 +124,97 @@ class GaitBatchIterable(IterableDataset):
 
             # Split features / meta
             feat_np = data[:, :, :321]
+            feat = torch.tensor(feat_np, dtype=torch.float32)
+            cycle_id = torch.arange(lo, hi, dtype=torch.int64) # ID de ciclo global (útil para evitar fugas entre train/val)
             if self.return_meta:
                 meta_np = data[:, :, 321:]
                 # Conversión con copia explícita a tensor (más seguro que from_numpy)
                 feat = torch.tensor(feat_np, dtype=torch.float32)
                 meta = torch.tensor(meta_np, dtype=torch.float32)
-                yield feat, meta
+                yield feat, meta, cycle_id
             else:
                 feat = torch.tensor(feat_np, dtype=torch.float32)
                 yield feat, feat
 
+
+# This adds epoch-based shuffling by incorporating the epoch number into the RNG seed.
+# class GaitBatchIterable(IterableDataset):
+#     def __init__(self, store_path, batch_size, return_meta=False,
+#                  shuffle=False, seed=42):
+#         self.store_path = store_path
+#         self.bs = batch_size
+#         self.return_meta = return_meta
+#         self.shuffle = shuffle
+#         self.seed = seed
+#         self.epoch = 0  # <- NEW
+
+#     def set_epoch(self, epoch: int):
+#         """Call this at the start of each epoch (training only)."""
+#         self.epoch = int(epoch)
+
+#     def __iter__(self):
+#         import os, numpy as np, torch, zarr
+#         from torch.utils.data import get_worker_info
+
+#         os.environ.setdefault("OMP_NUM_THREADS", "1")
+#         try:
+#             import numcodecs.blosc as nblosc
+#             nblosc.set_nthreads(1)
+#         except Exception:
+#             pass
+
+#         try:
+#             grp = zarr.open_consolidated(self.store_path, mode="r")
+#             z = grp["data"]
+#         except Exception:
+#             z = zarr.open(self.store_path, mode="r")["data"]
+
+#         n = int(z.shape[0])
+
+#         worker_info = get_worker_info()
+#         wid = worker_info.id if worker_info else 0
+
+#         # NEW: epoch enters the RNG seed so shuffle changes each epoch but is reproducible
+#         # Use a large multiplier to avoid collisions across epochs.
+#         base_seed = int(self.seed) + 100_000 * int(self.epoch) + int(wid)
+#         rng = np.random.default_rng(base_seed)
+
+#         batch_starts = np.arange(0, n, self.bs, dtype=np.int64)
+#         if self.shuffle:
+#             rng.shuffle(batch_starts)
+
+#         # Deterministic split across workers
+#         if worker_info:
+#             nw = worker_info.num_workers
+#             total = len(batch_starts)
+#             per, rem = total // nw, total % nw
+#             start = wid * per + min(wid, rem)
+#             end = start + per + (1 if wid < rem else 0)
+#             batch_starts = batch_starts[start:end]
+
+#         for s in batch_starts:
+#             lo = int(s)
+#             hi = int(min(s + self.bs, n))
+
+#             data = z[lo:hi].astype("float32", copy=True)
+
+#             feat_np = data[:, :, :321]
+#             feat = torch.tensor(feat_np, dtype=torch.float32)
+
+#             if self.return_meta:
+#                 meta_np = data[:, :, 321:]
+#                 meta = torch.tensor(meta_np, dtype=torch.float32)
+#                 yield feat, meta
+#             else:
+#                 yield feat, feat                
+# USE 
+# train_ds = GaitBatchIterable(train_path, micro_batch, return_meta=False, shuffle=True, seed=42)
+# train_loader = DataLoader(train_ds, batch_size=None, num_workers=num_workers, persistent_workers=False)
+
+# for epoch in range(num_epochs):
+#     train_ds.set_epoch(epoch)   # <- clave
+#     for xb, yb in train_loader:
+#         ...
 
 
 
