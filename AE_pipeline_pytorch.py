@@ -28,7 +28,7 @@ from pathlib import Path
 import time
 import psutil
 from sklearn.metrics import mean_absolute_error, r2_score
-
+import json 
 # ─── Seeds ─────────────────────────────────────────────────────────────
 os.environ['PYTHONHASHSEED'] = '0'
 random.seed(42)
@@ -218,6 +218,395 @@ class GaitBatchIterable(IterableDataset):
 
 
 
+class MultiSubjectGaitBatchIterable(IterableDataset):
+    """
+    Multi-subject batcher for Zarr store shaped like [N, T=100, C=321+meta_dim].
+    It samples `patients_per_batch` subjects and `samples_per_patient` cycles per subject.
+    Returns:
+      - feat:   [B, 100, feat_dim]
+      - meta0:  [B, meta_dim]   (subject, group, day, block, trial) from t=0 only
+      - cycle_id: [B] int64 with global cycle indices (idxs)
+    """
+    def __init__(self, store_path, subject_slices_json,
+                 patients_per_batch=16, samples_per_patient=16,
+                 return_meta=True, shuffle_subjects=True, seed=42,
+                 feat_dim=321, t_steps=100, meta_dim=5):
+        super().__init__()
+        self.store_path = str(store_path)
+        self.return_meta = bool(return_meta)
+
+        self.patients_per_batch = int(patients_per_batch)
+        self.samples_per_patient = int(samples_per_patient)
+        self.bs = self.patients_per_batch * self.samples_per_patient
+
+        self.shuffle_subjects = bool(shuffle_subjects)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        self.feat_dim = int(feat_dim)
+        self.meta_dim = int(meta_dim)
+        self.t_steps = int(t_steps)
+
+        # subject -> [lo, hi)
+        obj = json.loads(Path(subject_slices_json).read_text())
+        self.slices = {int(k): (int(v[0]), int(v[1])) for k, v in obj.items()}
+        self.subjects = sorted(self.slices.keys())
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        # Mitigate OpenMP / blosc thread issues
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        try:
+            import numcodecs.blosc as nblosc
+            nblosc.set_nthreads(1)
+        except Exception:
+            pass
+
+        # Open zarr
+        try:
+            grp = zarr.open_consolidated(self.store_path, mode="r")
+            z = grp["data"]
+        except Exception:
+            z = zarr.open(self.store_path, mode="r")["data"]
+
+        worker_info = get_worker_info()
+        wid = worker_info.id if worker_info else 0
+        nw  = worker_info.num_workers if worker_info else 1
+
+        # Epoch-aware RNG seed (reproducible reshuffling)
+        base_seed = self.seed + 100_000 * self.epoch + wid
+        rng = np.random.default_rng(base_seed)
+
+        subjects = self.subjects.copy()
+        if self.shuffle_subjects:
+            rng.shuffle(subjects)
+
+        # Deterministic split across workers
+        if worker_info:
+            total = len(subjects)
+            per, rem = total // nw, total % nw
+            start = wid * per + min(wid, rem)
+            end   = start + per + (1 if wid < rem else 0)
+            subjects = subjects[start:end]
+
+        i = 0
+        while i + self.patients_per_batch <= len(subjects):
+            batch_subj = subjects[i:i + self.patients_per_batch]
+            i += self.patients_per_batch
+
+            # Build idx list (keep contiguous picks per subject for locality)
+            idxs_list = []
+            for sid in batch_subj:
+                lo, hi = self.slices[sid]
+                n_cycles = hi - lo
+                if n_cycles <= 0:
+                    continue
+
+                if n_cycles >= self.samples_per_patient:
+                    # Fast contiguous block sampling
+                    start = rng.integers(lo, hi - self.samples_per_patient + 1)
+                    picks = np.arange(start, start + self.samples_per_patient, dtype=np.int64)
+                else:
+                    # Fallback: sample with replacement
+                    picks = rng.choice(np.arange(lo, hi), size=self.samples_per_patient, replace=True)
+
+                idxs_list.append(picks)
+
+            if not idxs_list:
+                continue
+
+            # Concatenate indices (do NOT shuffle before reading from zarr)
+            idxs = np.concatenate(idxs_list).astype(np.int64)  # [B]
+
+            # Read cycles (orthogonal selection)
+            data = z.get_orthogonal_selection(
+                (idxs, slice(None), slice(None))
+            ).astype("float32", copy=False)
+
+            # Features
+            feat = torch.from_numpy(data[:, :, :self.feat_dim]).contiguous()
+
+            # Meta only at t=0 -> [B, meta_dim]
+            meta0 = None
+            if self.return_meta:
+                meta0 = torch.from_numpy(
+                    data[:, 0, self.feat_dim:self.feat_dim + self.meta_dim]
+                ).contiguous()
+
+            # Cycle id (global indices)
+            cycle_id = torch.from_numpy(idxs).to(torch.int64)
+
+            # Shuffle AFTER loading (cheap in RAM)
+            perm = torch.randperm(feat.shape[0])
+            feat = feat[perm]
+            cycle_id = cycle_id[perm]
+            if meta0 is not None:
+                meta0 = meta0[perm]
+
+            if self.return_meta:
+                yield feat, meta0, cycle_id
+            else:
+                # For compatibility with older code expecting (x, y, cycle_id)
+                yield feat, feat, cycle_id
+
+
+
+class MultiSubjectGaitBatchIterable_XMeta(IterableDataset):
+    """
+    Zarr store must contain:
+      X    [N, 100, 321] float32
+      meta [N, 5] int32  (subject, group, day, block, trial)
+
+    Batching:
+      - patients_per_batch subjects per batch
+      - samples_per_patient cycles per subject
+      - total batch size B = patients_per_batch * samples_per_patient
+
+    Returns:
+      x:        [B,100,321] float32
+      meta0:    [B,5]       int32
+      cycle_id: [B]         int64 (global cycle indices)
+    """
+
+    def __init__(
+        self,
+        store_path,
+        subject_slices_json,
+        patients_per_batch=16,
+        samples_per_patient=16,
+        shuffle_subjects=True,
+        seed=42,
+        require_full_batch=True,  # if True, drop any subject with empty slice and require B exactly
+    ):
+        super().__init__()
+        self.store_path = str(store_path)
+        self.patients_per_batch = int(patients_per_batch)
+        self.samples_per_patient = int(samples_per_patient)
+        self.bs = self.patients_per_batch * self.samples_per_patient
+
+        self.shuffle_subjects = bool(shuffle_subjects)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.require_full_batch = bool(require_full_batch)
+
+        obj = json.loads(Path(subject_slices_json).read_text())
+        self.slices = {int(k): (int(v[0]), int(v[1])) for k, v in obj.items()}
+        self.subjects = sorted(self.slices.keys())
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def _set_thread_safety(self):
+        # Helps avoid oversubscription (important on clusters)
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        try:
+            import numcodecs.blosc as nblosc
+            nblosc.set_nthreads(1)
+        except Exception:
+            pass
+
+    def __iter__(self):
+        self._set_thread_safety()
+
+        # Open store (once per worker process)
+        try:
+            grp = zarr.open_consolidated(self.store_path, mode="r")
+        except Exception:
+            grp = zarr.open(self.store_path, mode="r")
+
+        X = grp["X"]
+        M = grp["meta"]
+
+        worker_info = get_worker_info()
+        wid = worker_info.id if worker_info else 0
+        nw = worker_info.num_workers if worker_info else 1
+
+        # Epoch-aware RNG seed (reproducible across epochs)
+        rng = np.random.default_rng(self.seed + 100_000 * self.epoch + wid)
+
+        subjects = self.subjects.copy()
+        if self.shuffle_subjects:
+            rng.shuffle(subjects)
+
+        # ---- IMPORTANT CHANGE ----
+        # Do NOT split subjects across workers. Split BATCHES across workers (strided),
+        # so we never end up with <patients_per_batch subjects per worker.
+        batches = [
+            subjects[j:j + self.patients_per_batch]
+            for j in range(0, len(subjects) - self.patients_per_batch + 1, self.patients_per_batch)
+        ]
+        if worker_info:
+            batches = batches[wid::nw]
+
+        # Iterate batches
+        for batch_subj in batches:
+            # Build idxs as blocks per subject (contiguous within each subject)
+            idxs_list = []
+            for sid in batch_subj:
+                lo, hi = self.slices[sid]
+                n = hi - lo
+                if n <= 0:
+                    if self.require_full_batch:
+                        idxs_list = []
+                        break
+                    else:
+                        continue
+
+                if n >= self.samples_per_patient:
+                    start0 = rng.integers(lo, hi - self.samples_per_patient + 1)
+                    idxs = np.arange(start0, start0 + self.samples_per_patient, dtype=np.int64)
+                else:
+                    # sample with replacement
+                    idxs = rng.integers(lo, hi, size=self.samples_per_patient, dtype=np.int64)
+
+                idxs_list.append(idxs)
+
+            if not idxs_list:
+                continue
+
+            idxs = np.concatenate(idxs_list).astype(np.int64)  # [B']
+            if self.require_full_batch and idxs.shape[0] != self.bs:
+                # ensure shape is stable if you rely on fixed batch size
+                continue
+
+            # ---- BIG WIN: only 2 reads per batch ----
+            x_np = X.get_orthogonal_selection((idxs, slice(None), slice(None)))  # float32 already
+            m_np = M.get_orthogonal_selection((idxs, slice(None)))              # int32 already
+
+            # Convert once
+            x = torch.from_numpy(x_np)       # [B,100,321]
+            meta0 = torch.from_numpy(m_np)   # [B,5]
+            cycle_id = torch.from_numpy(idxs).to(torch.int64)
+
+            # Shuffle inside batch (after read)
+            perm = torch.randperm(x.shape[0])
+            yield x[perm].contiguous(), meta0[perm].contiguous(), cycle_id[perm].contiguous()
+
+import os, json
+from pathlib import Path
+import numpy as np
+import torch
+from torch.utils.data import IterableDataset, DataLoader, get_worker_info
+import zarr
+
+
+class MultiSubjectGaitBatchIterable_XMeta_Fast(IterableDataset):
+    """
+    Zarr store:
+      X    [N, 100, 321] float32
+      meta [N, 5] int32
+
+    Returns:
+      x        [B,100,321]
+      meta0    [B,5]
+      cycle_id [B]
+    """
+    def __init__(
+        self,
+        store_path,
+        subject_slices_json,
+        patients_per_batch=16,
+        samples_per_patient=64,
+        shuffle_subjects=True,
+        seed=42,
+        require_full_batch=True,
+    ):
+        super().__init__()
+        self.store_path = str(store_path)
+        self.patients_per_batch = int(patients_per_batch)
+        self.samples_per_patient = int(samples_per_patient)
+        self.bs = self.patients_per_batch * self.samples_per_patient
+        self.shuffle_subjects = bool(shuffle_subjects)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.require_full_batch = bool(require_full_batch)
+
+        obj = json.loads(Path(subject_slices_json).read_text())
+        self.slices = {int(k): (int(v[0]), int(v[1])) for k, v in obj.items()}
+        self.subjects = sorted(self.slices.keys())
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        # Avoid thread oversubscription on cluster
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        try:
+            import numcodecs.blosc as nblosc
+            nblosc.set_nthreads(1)
+        except Exception:
+            pass
+
+        # Open once per worker
+        try:
+            grp = zarr.open_consolidated(self.store_path, mode="r")
+        except Exception:
+            grp = zarr.open(self.store_path, mode="r")
+
+        X = grp["X"]
+        M = grp["meta"]
+
+        worker_info = get_worker_info()
+        wid = worker_info.id if worker_info else 0
+        nw  = worker_info.num_workers if worker_info else 1
+
+        rng = np.random.default_rng(self.seed + 100_000 * self.epoch + wid)
+
+        subjects = self.subjects.copy()
+        if self.shuffle_subjects:
+            rng.shuffle(subjects)
+
+        # Build batches then stride by worker (prevents StopIteration from subject-splitting)
+        batches = [
+            subjects[j:j + self.patients_per_batch]
+            for j in range(0, len(subjects) - self.patients_per_batch + 1, self.patients_per_batch)
+        ]
+        if worker_info:
+            batches = batches[wid::nw]
+
+        for batch_subj in batches:
+            idxs_list = []
+            for sid in batch_subj:
+                lo, hi = self.slices[sid]
+                n = hi - lo
+                if n <= 0:
+                    if self.require_full_batch:
+                        idxs_list = []
+                        break
+                    else:
+                        continue
+
+                if n >= self.samples_per_patient:
+                    start0 = rng.integers(lo, hi - self.samples_per_patient + 1)
+                    idxs = np.arange(start0, start0 + self.samples_per_patient, dtype=np.int64)
+                else:
+                    # replacement
+                    idxs = rng.integers(lo, hi, size=self.samples_per_patient, dtype=np.int64)
+
+                idxs_list.append(idxs)
+
+            if not idxs_list:
+                continue
+
+            idxs = np.concatenate(idxs_list).astype(np.int64)
+            if self.require_full_batch and idxs.shape[0] != self.bs:
+                continue
+
+            # 2 reads per batch (fastest on network FS)
+            x_np = X.get_orthogonal_selection((idxs, slice(None), slice(None)))  # float32
+            m_np = M.get_orthogonal_selection((idxs, slice(None)))              # int32
+
+            x = torch.from_numpy(x_np)
+            meta0 = torch.from_numpy(m_np)
+            cycle_id = torch.from_numpy(idxs).to(torch.int64)
+
+            # shuffle after load
+            perm = torch.randperm(x.shape[0])
+            yield x[perm].contiguous(), meta0[perm].contiguous(), cycle_id[perm].contiguous()
+
+
 
 # ---- Model's Blocks (shared by AE and SemiSupAE)-----------------
 class GradientReversalFn(torch.autograd.Function):
@@ -271,7 +660,7 @@ class HeadMLP(nn.Module):
     def __init__(self, in_dim, hidden, out_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden), nn.ReLU(),
+            nn.Linear(in_dim, hidden), nn.ReLU(),nn.Dropout(0.1),
             nn.Linear(hidden, out_dim)
         )
     def forward(self, x): return self.net(x)
