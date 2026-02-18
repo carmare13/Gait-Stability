@@ -51,3 +51,7 @@ val_cycles_Xmeta.zarr
 best_model.pt
 best_privacy_model.pth
 LSTM_AE Mac.ipynb
+corr_pearson_test_sample.npy
+corr_spearman_test_sample.npy
+HDBSCAN_labels61440.npy
+MI_test_sample.npy
