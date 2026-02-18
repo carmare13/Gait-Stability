@@ -218,19 +218,37 @@ class GaitBatchIterable(IterableDataset):
 
 
 
+
+
 class MultiSubjectGaitBatchIterable(IterableDataset):
     """
-    Multi-subject batcher for Zarr store shaped like [N, T=100, C=321+meta_dim].
+    Multi-subject batcher for Zarr store shaped like:
+      data [N, T=100, C=feat_dim + meta_dim]
+    where meta columns are stored after the features along the last dimension.
+
     It samples `patients_per_batch` subjects and `samples_per_patient` cycles per subject.
-    Returns:
-      - feat:   [B, 100, feat_dim]
-      - meta0:  [B, meta_dim]   (subject, group, day, block, trial) from t=0 only
-      - cycle_id: [B] int64 with global cycle indices (idxs)
+
+    Yields:
+      feat:     [B, 100, feat_dim] float32
+      meta0:    [B, meta_dim]      (from t=0 only) float32 (as stored)
+      cycle_id: [B] int64 (global cycle indices)
     """
-    def __init__(self, store_path, subject_slices_json,
-                 patients_per_batch=16, samples_per_patient=16,
-                 return_meta=True, shuffle_subjects=True, seed=42,
-                 feat_dim=321, t_steps=100, meta_dim=5):
+
+    def __init__(
+        self,
+        store_path,
+        subject_slices_json,
+        patients_per_batch=16,
+        samples_per_patient=16,
+        return_meta=True,
+        shuffle_subjects=True,
+        seed=42,
+        feat_dim=321,
+        t_steps=100,
+        meta_dim=5,
+        infinite=True,
+        require_full_batch=True,
+    ):
         super().__init__()
         self.store_path = str(store_path)
         self.return_meta = bool(return_meta)
@@ -247,6 +265,9 @@ class MultiSubjectGaitBatchIterable(IterableDataset):
         self.meta_dim = int(meta_dim)
         self.t_steps = int(t_steps)
 
+        self.infinite = bool(infinite)
+        self.require_full_batch = bool(require_full_batch)
+
         # subject -> [lo, hi)
         obj = json.loads(Path(subject_slices_json).read_text())
         self.slices = {int(k): (int(v[0]), int(v[1])) for k, v in obj.items()}
@@ -255,7 +276,8 @@ class MultiSubjectGaitBatchIterable(IterableDataset):
     def set_epoch(self, epoch: int):
         self.epoch = int(epoch)
 
-    def __iter__(self):
+    @staticmethod
+    def _set_thread_safety():
         # Mitigate OpenMP / blosc thread issues
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         try:
@@ -264,66 +286,65 @@ class MultiSubjectGaitBatchIterable(IterableDataset):
         except Exception:
             pass
 
-        # Open zarr
+    def _open_zarr(self):
+        # Open zarr (once per worker process)
         try:
             grp = zarr.open_consolidated(self.store_path, mode="r")
             z = grp["data"]
         except Exception:
             z = zarr.open(self.store_path, mode="r")["data"]
+        return z
 
-        worker_info = get_worker_info()
-        wid = worker_info.id if worker_info else 0
-        nw  = worker_info.num_workers if worker_info else 1
-
-        # Epoch-aware RNG seed (reproducible reshuffling)
-        base_seed = self.seed + 100_000 * self.epoch + wid
-        rng = np.random.default_rng(base_seed)
-
+    def _iter_once(self, z, rng, worker_info):
+        # Prepare subject list for this pass
         subjects = self.subjects.copy()
         if self.shuffle_subjects:
             rng.shuffle(subjects)
 
-        # Deterministic split across workers
+        # Build batches of subjects
+        batches = [
+            subjects[j:j + self.patients_per_batch]
+            for j in range(0, len(subjects) - self.patients_per_batch + 1, self.patients_per_batch)
+        ]
+
+        # Split batches across workers (safe)
         if worker_info:
-            total = len(subjects)
-            per, rem = total // nw, total % nw
-            start = wid * per + min(wid, rem)
-            end   = start + per + (1 if wid < rem else 0)
-            subjects = subjects[start:end]
+            wid = worker_info.id
+            nw = worker_info.num_workers
+            batches = batches[wid::nw]
 
-        i = 0
-        while i + self.patients_per_batch <= len(subjects):
-            batch_subj = subjects[i:i + self.patients_per_batch]
-            i += self.patients_per_batch
-
-            # Build idx list (keep contiguous picks per subject for locality)
+        for batch_subj in batches:
             idxs_list = []
             for sid in batch_subj:
                 lo, hi = self.slices[sid]
                 n_cycles = hi - lo
                 if n_cycles <= 0:
-                    continue
+                    if self.require_full_batch:
+                        idxs_list = []
+                        break
+                    else:
+                        continue
 
                 if n_cycles >= self.samples_per_patient:
-                    # Fast contiguous block sampling
                     start = rng.integers(lo, hi - self.samples_per_patient + 1)
                     picks = np.arange(start, start + self.samples_per_patient, dtype=np.int64)
                 else:
                     # Fallback: sample with replacement
-                    picks = rng.choice(np.arange(lo, hi), size=self.samples_per_patient, replace=True)
+                    picks = rng.integers(lo, hi, size=self.samples_per_patient, dtype=np.int64)
 
                 idxs_list.append(picks)
 
             if not idxs_list:
                 continue
 
-            # Concatenate indices (do NOT shuffle before reading from zarr)
-            idxs = np.concatenate(idxs_list).astype(np.int64)  # [B]
+            idxs = np.concatenate(idxs_list).astype(np.int64)  # [B']
+            if self.require_full_batch and idxs.shape[0] != self.bs:
+                continue
 
-            # Read cycles (orthogonal selection)
-            data = z.get_orthogonal_selection(
-                (idxs, slice(None), slice(None))
-            ).astype("float32", copy=False)
+            # Single read per batch
+            data = z.get_orthogonal_selection((idxs, slice(None), slice(None)))
+            if data.dtype != np.float32:
+                data = data.astype("float32", copy=False)
 
             # Features
             feat = torch.from_numpy(data[:, :, :self.feat_dim]).contiguous()
@@ -338,7 +359,7 @@ class MultiSubjectGaitBatchIterable(IterableDataset):
             # Cycle id (global indices)
             cycle_id = torch.from_numpy(idxs).to(torch.int64)
 
-            # Shuffle AFTER loading (cheap in RAM)
+            # Shuffle AFTER loading (cheap)
             perm = torch.randperm(feat.shape[0])
             feat = feat[perm]
             cycle_id = cycle_id[perm]
@@ -348,9 +369,28 @@ class MultiSubjectGaitBatchIterable(IterableDataset):
             if self.return_meta:
                 yield feat, meta0, cycle_id
             else:
-                # For compatibility with older code expecting (x, y, cycle_id)
+                # Compatibility: (x, y, cycle_id)
                 yield feat, feat, cycle_id
 
+    def __iter__(self):
+        self._set_thread_safety()
+        z = self._open_zarr()
+
+        worker_info = get_worker_info()
+
+        # Worker-aware RNG
+        wid = worker_info.id if worker_info else 0
+        rng = np.random.default_rng(self.seed + 100_000 * self.epoch + wid)
+
+        # Infinite stream or single pass
+        if self.infinite:
+            while True:
+                yield from self._iter_once(z, rng, worker_info)
+                self.epoch += 1
+                # re-seed each epoch for reproducible reshuffling
+                rng = np.random.default_rng(self.seed + 100_000 * self.epoch + wid)
+        else:
+            yield from self._iter_once(z, rng, worker_info)
 
 
 class MultiSubjectGaitBatchIterable_XMeta(IterableDataset):
@@ -484,12 +524,7 @@ class MultiSubjectGaitBatchIterable_XMeta(IterableDataset):
             perm = torch.randperm(x.shape[0])
             yield x[perm].contiguous(), meta0[perm].contiguous(), cycle_id[perm].contiguous()
 
-import os, json
-from pathlib import Path
-import numpy as np
-import torch
-from torch.utils.data import IterableDataset, DataLoader, get_worker_info
-import zarr
+
 
 
 class MultiSubjectGaitBatchIterable_XMeta_Fast(IterableDataset):
@@ -660,7 +695,7 @@ class HeadMLP(nn.Module):
     def __init__(self, in_dim, hidden, out_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden), nn.ReLU(),nn.Dropout(0.1),
+            nn.Linear(in_dim, hidden), nn.ReLU(),nn.Dropout(0.5),
             nn.Linear(hidden, out_dim)
         )
     def forward(self, x): return self.net(x)
@@ -907,16 +942,24 @@ class LSTMConvAutoencoder(nn.Module):
 
 class SemiSupAE(nn.Module):
     def __init__(self, steps=100, in_dim=321, latent=128,
-                 n_group=2, n_nuisance=None, grl_lambda=1.0):
+                 n_group=2, n_nuisance=None, n_subjects=None, grl_lambda=1.0):
         super().__init__()
         self.encoder = BiLSTMEncoder(in_dim=in_dim, latent=latent)
         self.decoder = LSTMDecoder(out_dim=in_dim, steps=steps, latent=latent)
         self.group_head = HeadMLP(latent, 64, n_group)
         self.proj_head  = ProjectionHead(latent, 128)
+        
+        # Nuisance Ej Day 
         self.use_nuis = n_nuisance is not None
         if self.use_nuis:
             self.grl = GRL(lambd=grl_lambda)
             self.nuis_head = HeadMLP(latent, 64, n_nuisance)
+
+        # Adversarial para sujetos (Subject ID)
+        self.use_subject_adv = n_subjects is not None
+        if self.use_subject_adv:
+            self.grl_subj = GRL(lambd=grl_lambda)
+            self.subject_head = HeadMLP(latent, 128, n_subjects) # Clasificador de IDs    
 
     def forward(self, x, return_all=False):
         z = self.encoder(x)             # [B,128]
@@ -927,6 +970,9 @@ class SemiSupAE(nn.Module):
         if self.use_nuis:
             nuis_logits = self.nuis_head(self.grl(z))
             out["nuis_logits"] = nuis_logits
+        if self.use_subject_adv:
+            subj_logits = self.subject_head(self.grl_subj(z))
+            out["subj_logits"] = subj_logits    
         return out if return_all else (y_hat, logits)
 
 # ---------- EMA teacher for SemiSupAE ----------
@@ -994,11 +1040,21 @@ def train_step(batch, model, teacher, optimizer, weights,
     pid = batch['patient_id']
     nuis = batch.get('nuis', None)
 
+    # Debug print for nuisance variable
+    # if nuis is None:
+    #     print("nuis is None")
+    # else:
+    #     print("nuis present, adv weight =", weights.get("adv", None))
+
     # Augment for consistency
     x_strong = augment_fn(x)
     out_s = model(x, return_all=True)
+    if not hasattr(train_step, "first_check_done"):
+        print(f"\n[DEBUG] subj_logits in out_s: {'subj_logits' in out_s}")
+        train_step.first_check_done = True
     out_s_strong = model(x_strong, return_all=True)
-
+    
+    
     # Teacher forward (no grad)
     with torch.no_grad():
         out_t = teacher.teacher(x, return_all=True)
@@ -1008,9 +1064,17 @@ def train_step(batch, model, teacher, optimizer, weights,
 
     # Supervised group CE on labeled subset
     labeled_mask = (y_group >= 0)
+    labeled_frac = labeled_mask.float().mean().item()
+    #print(f"[train_step] Fraction of labeled samples in batch: {labeled_frac:.3f}")
     L_group = torch.tensor(0.0, device=x.device)
     if labeled_mask.any():
-        L_group = F.cross_entropy(out_s['logits'][labeled_mask], y_group[labeled_mask])
+        L_group = F.cross_entropy(out_s['logits'][labeled_mask], y_group[labeled_mask], label_smoothing=0.05)
+
+    # Adversarial per subject ID (if available
+    L_subj_adv = torch.tensor(0.0, device=x.device)
+    if model.use_subject_adv and weights.get("subj_adv", 0.0) > 0:
+        # Aquí es donde el GRL actúa: el Encoder será penalizado si el subject_head acierta
+        L_subj_adv = F.cross_entropy(out_s['subj_logits'], pid)#    
 
     # Pseudo-labels on unlabeled
     unl_mask = ~labeled_mask
@@ -1026,15 +1090,17 @@ def train_step(batch, model, teacher, optimizer, weights,
     L_cons = consistency_loss(out_s_strong['logits'], out_t['logits'])
 
     # SupCon with patient identity
-    L_supcon = supcon_loss(out_s['proj'], pid)
+    L_supcon = torch.tensor(0.0, device=x.device)
+    if weights.get("supcon", 0.0) > 0:
+        L_supcon = supcon_loss(out_s['proj'], pid)
 
     # Adversarial invariance to nuisance (if available)
     L_adv = torch.tensor(0.0, device=x.device)
-    if nuis is not None and model.use_nuis:
+    if weights.get("adv", 0.0) > 0 and nuis is not None and model.use_nuis:
         L_adv = F.cross_entropy(out_s['nuis_logits'], nuis)
 
     # Total
-    L = (weights['rec']*L_rec + weights['group']*L_group +
+    L = (weights['rec']*L_rec + weights['group']*L_group + weights.get('subj_adv', 0.0) * L_subj_adv +
          weights['supcon']*L_supcon + weights['cons']*L_cons +
          weights['adv']*L_adv)
 
@@ -1046,6 +1112,7 @@ def train_step(batch, model, teacher, optimizer, weights,
 
     return { "loss": L.item(), "rec": L_rec.item(),
              "group": L_group.item() if isinstance(L_group, torch.Tensor) else L_group,
+             "subj_adv": L_subj_adv.item() if isinstance(L_subj_adv, torch.Tensor) else L_subj_adv,
              "supcon": L_supcon.item(), "cons": L_cons.item(),
              "adv": L_adv.item() if isinstance(L_adv, torch.Tensor) else L_adv }
 

@@ -47,3 +47,7 @@ pairs_pearson_dcor_candidates.npy
 
 train_cycles_Xmeta.zarr
 val_cycles_Xmeta.zarr
+
+best_model.pt
+best_privacy_model.pth
+LSTM_AE Mac.ipynb
