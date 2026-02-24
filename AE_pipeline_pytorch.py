@@ -127,7 +127,7 @@ class GaitBatchIterable(IterableDataset):
             feat = torch.tensor(feat_np, dtype=torch.float32)
             cycle_id = torch.arange(lo, hi, dtype=torch.int64) # ID de ciclo global (útil para evitar fugas entre train/val)
             if self.return_meta:
-                meta_np = data[:, :, 321:]
+                meta_np = data[:, 0, 321:]
                 # Conversión con copia explícita a tensor (más seguro que from_numpy)
                 feat = torch.tensor(feat_np, dtype=torch.float32)
                 meta = torch.tensor(meta_np, dtype=torch.float32)
@@ -216,7 +216,439 @@ class GaitBatchIterable(IterableDataset):
 #     for xb, yb in train_loader:
 #         ...
 
+import os
+import json
+from pathlib import Path
 
+import numpy as np
+import torch
+import zarr
+from torch.utils.data import IterableDataset, get_worker_info
+
+
+class MultiSubjectGaitBatchIterable2(IterableDataset):
+    """
+    Multi-subject batcher for Zarr store shaped like:
+      data [N, T=100, C=feat_dim + meta_dim]
+    where meta columns are stored after the features along the last dimension.
+
+    It samples `patients_per_batch` subjects and `samples_per_patient` cycles per subject.
+
+    Yields:
+      feat:     [B, T, feat_dim] float32
+      meta0:    [B, meta_dim]   float32 (from t=0 only) as stored in zarr
+      cycle_id: [B] int64 (global cycle indices)
+    """
+
+    def __init__(
+        self,
+        store_path,
+        subject_slices_json,
+        patients_per_batch=16,
+        samples_per_patient=16,
+        return_meta=True,
+        shuffle_subjects=True,
+        seed=42,
+        feat_dim=321,
+        t_steps=100,
+        meta_dim=5,
+        infinite=True,
+        require_full_batch=True,
+
+        # --- new options ---
+        no_replace_within_subject=True,
+        trial_slices_json=None,          # if provided -> no-replace within (subject, trial)
+        trial_balanced=True,             # if True, try to spread k across trials within a subject
+        sort_indices_for_io=True,        # if True, sort global idxs before zarr selection
+    ):
+        super().__init__()
+        self.store_path = str(store_path)
+        self.return_meta = bool(return_meta)
+
+        self.patients_per_batch = int(patients_per_batch)
+        self.samples_per_patient = int(samples_per_patient)
+        self.bs = self.patients_per_batch * self.samples_per_patient
+
+        self.shuffle_subjects = bool(shuffle_subjects)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        self.feat_dim = int(feat_dim)
+        self.meta_dim = int(meta_dim)
+        self.t_steps = int(t_steps)
+
+        self.infinite = bool(infinite)
+        self.require_full_batch = bool(require_full_batch)
+
+        self.no_replace_within_subject = bool(no_replace_within_subject)
+        self.trial_slices_json = str(trial_slices_json) if trial_slices_json else None
+        self.trial_balanced = bool(trial_balanced)
+        self.sort_indices_for_io = bool(sort_indices_for_io)
+
+        # subject -> [lo, hi)
+        obj = json.loads(Path(subject_slices_json).read_text())
+        self.slices = {int(k): (int(v[0]), int(v[1])) for k, v in obj.items()}
+        self.subjects = sorted(self.slices.keys())
+
+        # Optional: (subject -> trial -> [lo, hi))
+        # Expected JSON format:
+        # { "123": { "1": [lo, hi], "2": [lo, hi], "3": [lo, hi] }, "124": {...} }
+        self.trial_slices = None
+        if self.trial_slices_json is not None:
+            obj_t = json.loads(Path(self.trial_slices_json).read_text())
+            # Convert keys to int for faster access
+            trial_slices = {}
+            for sid_str, d in obj_t.items():
+                sid = int(sid_str)
+                trial_slices[sid] = {int(tr_str): (int(v[0]), int(v[1])) for tr_str, v in d.items()}
+            self.trial_slices = trial_slices
+
+        # --- per-worker sampling state (initialized lazily in __iter__) ---
+        # Subject-level
+        self._perm_subj = None  # dict[sid] -> perm of local indices [0..n-1]
+        self._ptr_subj = None   # dict[sid] -> pointer
+
+        # Trial-level
+        self._perm_trial = None # dict[(sid, trial)] -> perm
+        self._ptr_trial = None  # dict[(sid, trial)] -> pointer
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    @staticmethod
+    def _set_thread_safety():
+        # Mitigate OpenMP / blosc thread issues
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        try:
+            import numcodecs.blosc as nblosc
+            nblosc.set_nthreads(1)
+        except Exception:
+            pass
+
+    def _open_zarr(self):
+        # Open zarr (once per worker process)
+        try:
+            grp = zarr.open_consolidated(self.store_path, mode="r")
+            z = grp["data"]
+        except Exception:
+            z = zarr.open(self.store_path, mode="r")["data"]
+        return z
+
+    # -----------------------------
+    # No-replacement samplers
+    # -----------------------------
+    def _init_subject_state_if_needed(self, rng):
+        if (self._perm_subj is not None) and (self._ptr_subj is not None):
+            return
+        self._perm_subj = {}
+        self._ptr_subj = {}
+        for sid in self.subjects:
+            lo, hi = self.slices[sid]
+            n = hi - lo
+            if n > 0:
+                self._perm_subj[sid] = rng.permutation(n).astype(np.int64)
+                self._ptr_subj[sid] = 0
+
+    def _init_trial_state_if_needed(self, rng):
+        if self.trial_slices is None:
+            return
+        if (self._perm_trial is not None) and (self._ptr_trial is not None):
+            return
+        self._perm_trial = {}
+        self._ptr_trial = {}
+        for sid, trials in self.trial_slices.items():
+            for tr, (lo, hi) in trials.items():
+                n = hi - lo
+                if n > 0:
+                    self._perm_trial[(sid, tr)] = rng.permutation(n).astype(np.int64)
+                    self._ptr_trial[(sid, tr)] = 0
+
+    def _sample_no_replace_range(self, perm, ptr, lo, hi, k, rng):
+        """
+        Generic no-replacement sampler for a contiguous global range [lo, hi).
+        perm: permutation of local indices [0..n-1]
+        ptr: current pointer
+        Returns (picks_global, new_perm, new_ptr)
+        """
+        n = hi - lo
+        if n <= 0:
+            return None, perm, ptr
+
+        if n < k:
+            # controlled partial replacement (rare if data is large)
+            base = lo + np.arange(n, dtype=np.int64)
+            extra = rng.integers(lo, hi, size=(k - n), dtype=np.int64)
+            return np.concatenate([base, extra]), perm, ptr
+
+        if ptr + k <= n:
+            idx_local = perm[ptr:ptr + k]
+            ptr = ptr + k
+            return lo + idx_local, perm, ptr
+
+        # wrap: consume remaining, reshuffle, take rest
+        first = perm[ptr:]
+        perm2 = rng.permutation(n).astype(np.int64)
+        need = k - (n - ptr)
+        second = perm2[:need]
+        perm = perm2
+        ptr = need
+        return lo + np.concatenate([first, second]), perm, ptr
+
+    def _sample_subject_no_replace(self, sid, k, rng):
+        lo, hi = self.slices[sid]
+        perm = self._perm_subj.get(sid, None)
+        ptr = self._ptr_subj.get(sid, 0)
+        if perm is None:
+            return None
+        picks, perm, ptr = self._sample_no_replace_range(perm, ptr, lo, hi, k, rng)
+        self._perm_subj[sid] = perm
+        self._ptr_subj[sid] = ptr
+        return picks
+
+    def _sample_subject_trials_no_replace(self, sid, k, rng):
+        """
+        Sample k cycles from (sid, trial) pools, without replacement within each pool.
+        Requires self.trial_slices.
+
+        If trial_balanced=True: try to spread samples across available trials.
+        Else: pick a random trial each time (still no-replace inside that trial).
+        """
+        trials = self.trial_slices.get(sid, None)
+        if not trials:
+            return None
+
+        trial_ids = sorted(trials.keys())
+        # Filter trials with >0 cycles
+        trial_ids = [tr for tr in trial_ids if (trials[tr][1] - trials[tr][0]) > 0]
+        if not trial_ids:
+            return None
+
+        picks_all = []
+
+        if not self.trial_balanced:
+            # Random-trial picks (k times in chunks)
+            remaining = k
+            while remaining > 0:
+                tr = int(rng.choice(trial_ids))
+                lo, hi = trials[tr]
+                key = (sid, tr)
+                perm = self._perm_trial.get(key, None)
+                if perm is None:
+                    # init on the fly if missing
+                    n = hi - lo
+                    if n <= 0:
+                        trial_ids.remove(tr)
+                        if not trial_ids:
+                            break
+                        continue
+                    perm = rng.permutation(n).astype(np.int64)
+                    self._perm_trial[key] = perm
+                    self._ptr_trial[key] = 0
+
+                ptr = self._ptr_trial[key]
+                # take up to remaining, but in a single call
+                take = remaining
+                got, perm2, ptr2 = self._sample_no_replace_range(perm, ptr, lo, hi, take, rng)
+                if got is None or got.size == 0:
+                    trial_ids.remove(tr)
+                    if not trial_ids:
+                        break
+                    continue
+                self._perm_trial[key] = perm2
+                self._ptr_trial[key] = ptr2
+                picks_all.append(got)
+                remaining -= got.size
+
+        else:
+            # Balanced across trials: allocate roughly evenly, then distribute remainder
+            ntr = len(trial_ids)
+            base = k // ntr
+            rem = k % ntr
+
+            # Randomize trial order per subject draw to avoid always same trial priority
+            trial_order = trial_ids.copy()
+            rng.shuffle(trial_order)
+
+            # First pass: base samples from each trial
+            for tr in trial_order:
+                need = base + (1 if rem > 0 else 0)
+                if rem > 0:
+                    rem -= 1
+                if need <= 0:
+                    continue
+
+                lo, hi = trials[tr]
+                key = (sid, tr)
+                perm = self._perm_trial.get(key, None)
+                if perm is None:
+                    n = hi - lo
+                    if n <= 0:
+                        continue
+                    perm = rng.permutation(n).astype(np.int64)
+                    self._perm_trial[key] = perm
+                    self._ptr_trial[key] = 0
+                ptr = self._ptr_trial[key]
+
+                got, perm2, ptr2 = self._sample_no_replace_range(perm, ptr, lo, hi, need, rng)
+                if got is None or got.size == 0:
+                    continue
+                self._perm_trial[key] = perm2
+                self._ptr_trial[key] = ptr2
+                picks_all.append(got)
+
+            # If due to small trials we got fewer than k, top-up from random trials
+            total_got = int(sum(x.size for x in picks_all))
+            remaining = k - total_got
+            if remaining > 0:
+                # fallback: sample at subject-level no-replace (keeps coverage)
+                extra = self._sample_subject_no_replace(sid, remaining, rng)
+                if extra is not None and extra.size > 0:
+                    picks_all.append(extra)
+
+        if not picks_all:
+            return None
+
+        picks = np.concatenate(picks_all).astype(np.int64)
+        # Ensure exactly k if require_full_batch expects fixed shape:
+        if picks.size > k:
+            # trim deterministically
+            picks = picks[:k]
+        return picks
+
+    # -----------------------------
+    # Main iteration
+    # -----------------------------
+    def _iter_once(self, z, rng, worker_info):
+        # Prepare subject list for this pass
+        subjects = self.subjects.copy()
+        if self.shuffle_subjects:
+            rng.shuffle(subjects)
+
+        # Build batches of subjects
+        batches = [
+            subjects[j:j + self.patients_per_batch]
+            for j in range(0, len(subjects) - self.patients_per_batch + 1, self.patients_per_batch)
+        ]
+
+        # Split batches across workers
+        if worker_info:
+            wid = worker_info.id
+            nw = worker_info.num_workers
+            batches = batches[wid::nw]
+
+        for batch_subj in batches:
+            idxs_list = []
+
+            for sid in batch_subj:
+                lo, hi = self.slices[sid]
+                n_cycles = hi - lo
+                if n_cycles <= 0:
+                    if self.require_full_batch:
+                        idxs_list = []
+                        break
+                    else:
+                        continue
+
+                # --- proposed: no-replacement sampling ---
+                if self.no_replace_within_subject:
+                    if self.trial_slices is not None:
+                        picks = self._sample_subject_trials_no_replace(
+                            sid=sid, k=self.samples_per_patient, rng=rng
+                        )
+                        if picks is None:
+                            # fallback to subject-level
+                            picks = self._sample_subject_no_replace(
+                                sid=sid, k=self.samples_per_patient, rng=rng
+                            )
+                    else:
+                        picks = self._sample_subject_no_replace(
+                            sid=sid, k=self.samples_per_patient, rng=rng
+                        )
+                else:
+                    # Old behavior: random window / replacement
+                    if n_cycles >= self.samples_per_patient:
+                        start = rng.integers(lo, hi - self.samples_per_patient + 1)
+                        picks = np.arange(start, start + self.samples_per_patient, dtype=np.int64)
+                    else:
+                        picks = rng.integers(lo, hi, size=self.samples_per_patient, dtype=np.int64)
+
+                if picks is None or picks.size == 0:
+                    if self.require_full_batch:
+                        idxs_list = []
+                        break
+                    else:
+                        continue
+
+                idxs_list.append(picks)
+
+            if not idxs_list:
+                continue
+
+            idxs = np.concatenate(idxs_list).astype(np.int64)  # [B'] expected == self.bs
+            if self.require_full_batch and idxs.shape[0] != self.bs:
+                continue
+
+            # Sort indices to improve IO locality (optional)
+            if self.sort_indices_for_io:
+                order = np.argsort(idxs)
+                idxs_read = idxs[order]
+            else:
+                idxs_read = idxs
+
+            # Single read per batch (fancy indexing)
+            data = z.get_orthogonal_selection((idxs_read, slice(None), slice(None)))
+            if data.dtype != np.float32:
+                data = data.astype("float32", copy=False)
+
+            # Features
+            feat = torch.from_numpy(data[:, :, :self.feat_dim]).contiguous()
+
+            # Meta only at t=0 -> [B, meta_dim]
+            meta0 = None
+            if self.return_meta:
+                meta0 = torch.from_numpy(
+                    data[:, 0, self.feat_dim:self.feat_dim + self.meta_dim]
+                ).contiguous()
+
+            # Cycle id (global indices)
+            cycle_id = torch.from_numpy(idxs_read).to(torch.int64)
+
+            # Shuffle AFTER loading (cheap)
+            perm = torch.randperm(feat.shape[0])
+            feat = feat[perm]
+            cycle_id = cycle_id[perm]
+            if meta0 is not None:
+                meta0 = meta0[perm]
+
+            if self.return_meta:
+                yield feat, meta0, cycle_id
+            else:
+                yield feat, feat, cycle_id
+
+    def __iter__(self):
+        self._set_thread_safety()
+        z = self._open_zarr()
+
+        worker_info = get_worker_info()
+
+        # Worker-aware RNG
+        wid = worker_info.id if worker_info else 0
+        rng = np.random.default_rng(self.seed + 100_000 * self.epoch + wid)
+
+        # Init state ONCE per worker (persistent across epochs)
+        if self.no_replace_within_subject:
+            self._init_subject_state_if_needed(rng)
+            self._init_trial_state_if_needed(rng)
+
+        # Infinite stream or single pass
+        if self.infinite:
+            while True:
+                yield from self._iter_once(z, rng, worker_info)
+                self.epoch += 1
+                # Re-seed each epoch for reproducible reshuffling of subject order
+                rng = np.random.default_rng(self.seed + 100_000 * self.epoch + wid)
+        else:
+            yield from self._iter_once(z, rng, worker_info)
 
 
 
