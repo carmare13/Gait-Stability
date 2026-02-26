@@ -781,29 +781,37 @@ def _encode_metadata_to_numeric(meta_dict: dict) -> np.ndarray:
     return np.array(numeric_values, dtype=int)
 
 def save_patient_preprocessed_tensors(pid: str,
-                                    group_code: str,
-                                    target_length: int,
-                                    num_kinematic_variables: int,
-                                    global_scaler,
-                                    subfolder_name: str = "preprocessed",
-                                    verbose: bool = True):
+                                     group_code: str,
+                                     target_length: int,
+                                     num_kinematic_variables: int,
+                                     global_scaler,
+                                     subfolder_name: str = "preprocessed",
+                                     verbose: bool = True):
     """
     Processes all trimmed trials for a patient:
     1. Temporally normalizes each cycle using temporal_normalization_GC.
     2. Applies feature normalization using the fitted global_scaler.
-    3. Encodes and appends metadata columns.
+    3. Encodes and appends metadata columns (now includes cycle_in_trial).
     4. Saves the final 3D tensor per trial as .npy in a patient subfolder.
 
+    Metadata columns appended (order):
+      [patient_id, group, day, block, trial, cycle_in_trial]
+
     Args:
-        pid: Patient identifier.
+        pid: Patient identifier (e.g., "S039").
         group_code: Group code (must exist in base_folders).
         target_length: Number of timesteps per cycle after temporal normalization.
-        num_kinematic_variables: In case in the future we have more than 321 kinematic variables.
+        num_kinematic_variables: Number of kinematic variables (e.g., 321).
+        global_scaler: Fitted scaler with .transform().
         subfolder_name: Name of subfolder under patient to save outputs.
         verbose: Print progress messages.
     """
+    import os
+    import numpy as np
+
     if group_code not in base_folders:
         raise ValueError(f"Group '{group_code}' not found in base_folders.")
+
     patient_base = os.path.join(base_folders[group_code], pid)
     trimmed_folder = os.path.join(patient_base, "trimmed")
     if not os.path.isdir(trimmed_folder):
@@ -829,10 +837,10 @@ def save_patient_preprocessed_tensors(pid: str,
             continue
 
         if df_trial.isna().any().any():
-            print(f"[ERROR] ¡Todavía NaNs en {os.path.basename(filepath)}!") 
+            print(f"[ERROR] ¡Todavía NaNs en {os.path.basename(filepath)}!")
             continue
 
-        # 1) Temporal normalization per cycle
+        # 1) Temporal normalization per cycle (segmentation happens inside)
         kin_df = df_trial.iloc[:, :num_kinematic_variables]
         tensor_cycles = temporal_normalization_GC(kin_df, target_length)
         if tensor_cycles.size == 0:
@@ -846,25 +854,37 @@ def save_patient_preprocessed_tensors(pid: str,
         scaled_flat = global_scaler.transform(flat)
         scaled_cycles = scaled_flat.reshape(n_cycles, target_length, num_kinematic_variables)
 
-        # 3) Metadata encoding
-        meta = _encode_metadata_to_numeric({
-            'patient_id': pid,
-            'group': group_code,
-            'day': day,
-            'block': block,
-            'trial': trial
-        })  # returns 1D array of length M_meta
-        M_meta = len(meta)
-        meta_tensor = np.tile(meta, (n_cycles, target_length, 1))
+        # 3) Metadata encoding (base meta per trial) + cycle_in_trial (per cycle)
+        base_meta = _encode_metadata_to_numeric({
+            "patient_id": pid,
+            "group": group_code,
+            "day": day,
+            "block": block,
+            "trial": trial
+        })  # shape: (M_base,)
+
+        # cycle index within this trial: 0..n_cycles-1
+        cycle_in_trial = np.arange(n_cycles, dtype=np.float32)[:, None]  # (n_cycles, 1)
+
+        # make per-cycle meta matrix: (n_cycles, M_base + 1)
+        base_meta_mat = np.tile(np.asarray(base_meta, dtype=np.float32)[None, :], (n_cycles, 1))
+        cycle_meta = np.concatenate([base_meta_mat, cycle_in_trial], axis=1)  # (n_cycles, M_base+1)
+
+        # expand to (n_cycles, target_length, M_meta)
+        meta_tensor = np.tile(cycle_meta[:, None, :], (1, target_length, 1))
 
         # 4) Concatenate features + metadata
-        final_tensor = np.concatenate((scaled_cycles, meta_tensor), axis=2)
+        final_tensor = np.concatenate((scaled_cycles.astype(np.float32, copy=False),
+                                       meta_tensor.astype(np.float32, copy=False)),
+                                      axis=2)
 
         # 5) Save
         fname = f"{pid}_{day}_{block}_{trial}_preprocessed.npy"
         np.save(os.path.join(out_folder, fname), final_tensor)
+
         if verbose:
-            print(f"  [OK] {fname} -> shape {final_tensor.shape}")
+            # meta dims = len(base_meta)+1
+            print(f"  [OK] {fname} -> shape {final_tensor.shape} (meta_cols={cycle_meta.shape[1]})")
 
 def clean_and_save_trial(input_path: str, eps: float = 1e-8) -> bool:
     """
