@@ -14,6 +14,9 @@ NONAN_Library_main/
 prueba.ipynb
 saved_models
 logs
+test_cycles.zarr
+train_cycles.zarr
+val_cycles.zarr
 test_cycles1.zarr
 train_cycles1.zarr
 val_cycles1.zarr

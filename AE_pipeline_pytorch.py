@@ -122,11 +122,11 @@ class GaitBatchIterable(IterableDataset):
             data = z[lo:hi].astype("float32", copy=True)   # COPIA SEGURA
 
             # Split features / meta
-            feat_np = data[:, :, :321]
+            feat_np = data[:, :, :336]
             feat = torch.tensor(feat_np, dtype=torch.float32)
             cycle_id = torch.arange(lo, hi, dtype=torch.int64) # ID de ciclo global (útil para evitar fugas entre train/val)
             if self.return_meta:
-                meta_np = data[:, 0, 321:326]
+                meta_np = data[:, 0, 336:343]
                 # Conversión con copia explícita a tensor (más seguro que from_numpy)
                 feat = torch.tensor(feat_np, dtype=torch.float32)
                 meta = torch.tensor(meta_np, dtype=torch.float32)
