@@ -6,6 +6,7 @@ import numpy as np
 import json
 import random
 import re
+import glob 
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler  # Z-score normalization
 from sklearn.preprocessing import MinMaxScaler  # Min-Max normalization
@@ -28,6 +29,11 @@ from downsample import downsample_df
 from gait_events import gait_events_HC_JA
 from segment_utils import segment_cycles_simple
 
+
+# Folder where this .py lives (assumes the 3 trial characteristics CSVs are in the same folder). We use this to load trial characteristics for walking direction.
+TRIAL_CHAR_DIR = os.path.dirname(os.path.abspath(__file__))
+
+_TRIAL_CHAR_CACHE: dict[str, pd.DataFrame] = {}
 
 # ─── Trim signal edges to avoid starting and ending noise ───────────────────────────────────────
 def trim_signal_edges(df, fs, trim_seconds):
@@ -654,7 +660,7 @@ def set_scaler(
             if patient_id not in list_patient_ids(base_folder):
                 continue
 
-            patient_folder = os.path.join(base_folder, patient_id, "trimmed")
+            patient_folder = os.path.join(base_folder, patient_id, "trimmed_sc")
             trials_list, _ = load_patient_data(patient_folder, patient_id, group_code, verbose=True)
 
             if not trials_list:
@@ -663,7 +669,15 @@ def set_scaler(
                 break
 
             for trial_df in tqdm(trials_list, desc=f"Trials {patient_id}", unit="tr", leave=False):
+                # Drop time column if present (case-insensitive)
+                time_cols = [c for c in trial_df.columns if c.lower() == "time"]
+                if time_cols:
+                    trial_df = trial_df.drop(columns=time_cols)
+
                 kinematic_df = trial_df.iloc[:, :num_kinematic_var]
+                if kinematic_df.shape[1] != num_kinematic_var:
+                    tqdm.write(f"[WARN] {patient_id}: got {kinematic_df.shape[1]} kinematic cols after dropping time. Skipping.")
+                    continue
                 normalized_cycles = temporal_normalization_GC(
                     kinematic_df, target_length=target_length
                 )
@@ -708,6 +722,121 @@ def set_scaler(
         tqdm.write(f"Data max (first 5): {scaler.data_max_[:5]}")
 
     return scaler
+#---------- parallel version of set_scaler (safe + fast) ─────────────────────────────────────────────────
+import os
+import numpy as np
+from joblib import Parallel, delayed, dump
+from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
+import re
+
+def _drop_time_if_present(df):
+    time_cols = [c for c in df.columns if c.lower() == "time"]
+    return df.drop(columns=time_cols) if time_cols else df
+
+def _worker_patient_stats(patient_id: str, target_length: int, num_kinematic_var: int):
+    """
+    Computes (n, sum, sumsq) over ALL normalized samples for this patient across all trials.
+    Returns None if patient not found or no data.
+    """
+    found_any = False
+    n_total = 0
+    sum_total = np.zeros((num_kinematic_var,), dtype=np.float64)
+    sumsq_total = np.zeros((num_kinematic_var,), dtype=np.float64)
+
+    for group_code, base_folder in base_folders.items():
+        if patient_id not in list_patient_ids(base_folder):
+            continue
+
+        patient_folder = os.path.join(base_folder, patient_id, "trimmed_sc")
+        trials_list, _ = load_patient_data(patient_folder, patient_id, group_code, verbose=False)
+
+        found_any = True
+        if not trials_list:
+            return None
+
+        for trial_df in trials_list:
+            trial_df = _drop_time_if_present(trial_df)
+
+            kin_df = trial_df.iloc[:, :num_kinematic_var]
+            if kin_df.shape[1] != num_kinematic_var:
+                # schema mismatch -> skip trial
+                continue
+
+            cycles = temporal_normalization_GC(kin_df, target_length=target_length)
+            if cycles.size == 0:
+                continue
+
+            X = cycles.reshape(-1, num_kinematic_var).astype(np.float64, copy=False)
+            n = X.shape[0]
+
+            n_total += n
+            sum_total += X.sum(axis=0)
+            sumsq_total += (X * X).sum(axis=0)
+
+        return (n_total, sum_total, sumsq_total)
+
+    if not found_any:
+        return None
+
+    return (n_total, sum_total, sumsq_total)
+
+def fit_standard_scaler_parallel(
+    training_patient_ids: list[str],
+    target_length: int,
+    num_kinematic_var: int,
+    scaler_filename: str = "global_kinematic_scaler_zscore_NoTime.pkl",
+    n_jobs: int = 16,
+):
+    """
+    Fits a StandardScaler using parallel aggregation of sums/sumsq (safe + fast).
+    """
+    results = Parallel(n_jobs=n_jobs, prefer="processes", verbose=0)(
+        delayed(_worker_patient_stats)(pid, target_length, num_kinematic_var)
+        for pid in tqdm(training_patient_ids, desc="Patients", unit="pt")
+    )
+
+    # Reduce
+    n_total = 0
+    sum_total = np.zeros((num_kinematic_var,), dtype=np.float64)
+    sumsq_total = np.zeros((num_kinematic_var,), dtype=np.float64)
+
+    used = 0
+    for r in results:
+        if r is None:
+            continue
+        n, s, ss = r
+        if n <= 0:
+            continue
+        n_total += n
+        sum_total += s
+        sumsq_total += ss
+        used += 1
+
+    if n_total == 0:
+        raise ValueError("No data processed: cannot fit scaler.")
+
+    mean = sum_total / n_total
+    var = (sumsq_total / n_total) - (mean ** 2)
+    # numerical guard
+    var = np.maximum(var, 1e-12)
+    scale = np.sqrt(var)
+
+    scaler = StandardScaler()
+    scaler.mean_ = mean.astype(np.float64)
+    scaler.var_ = var.astype(np.float64)
+    scaler.scale_ = scale.astype(np.float64)
+    scaler.n_features_in_ = num_kinematic_var
+    scaler.n_samples_seen_ = n_total
+
+    dump(scaler, scaler_filename)
+    print(f"[INFO] StandardScaler saved to: {scaler_filename}")
+    print(f"[INFO] Patients used: {used}/{len(training_patient_ids)} | total samples: {n_total}")
+    print(f"[INFO] mean[:5]={scaler.mean_[:5]}")
+    print(f"[INFO] scale[:5]={scaler.scale_[:5]}")
+
+    return scaler
+
 # ─── Dataset split  ─────────────────────────────────────────────────
 def split_subjects_by_cycle_count(subjects_dict, train_ratio=0.7,val_ratio=0.15, seed=42):
     """
@@ -754,11 +883,118 @@ def split_subjects_by_cycle_count(subjects_dict, train_ratio=0.7,val_ratio=0.15,
 
     return train_subjects, val_subjects, test_subjects, total_cycles
 
+# ─── Walking direction  ─────────────────────────────────────────────────
+def _normalize_subject_id_for_trial_chars(pid: str, group_code: str) -> tuple[str, str]:
+    """
+    Returns (primary_id, fallback_id) for matching trial-characteristics 'id' column.
+    - G2/G3: usually "SXXX"
+    - G1: usually numeric "X"/"XX"
+    """
+    pid_str = str(pid).strip()
+    m = re.search(r"(\d+)", pid_str)
+    if not m:
+        return (pid_str, pid_str)
+
+    pid_int = int(m.group(1))
+    sid_S = f"S{pid_int:03d}"   # "S039"
+    sid_num = str(pid_int)      # "39"
+
+    g = str(group_code).upper().strip()
+    if g in ("G2", "G3"):
+        return (sid_S, sid_num)
+    if g == "G1":
+        return (sid_num, sid_S)
+
+    return (sid_S, sid_num)
+
+def _digits_str(x: str) -> str:
+    m = re.search(r"(\d+)", str(x))
+    return str(int(m.group(1))) if m else str(x).strip()
+
+def _pid_to_trialchar_id(pid: str, group_code: str) -> str:
+    """
+    G01: trial characteristics 'id' is numeric (e.g., 6)
+    G02/G03: trial characteristics 'id' is 'SXXX' (e.g., S006)
+    """
+    g = str(group_code).upper().strip()
+    pid_num = _digits_str(pid)      # "S006" -> "6"
+    pid_int = int(pid_num)
+    pid_S = f"S{pid_int:03d}"       # "S006"
+
+    if g == "G01":
+        return pid_num              # "6"
+    else:
+        return pid_S                # "S006"
+
+
+def _load_trial_characteristics(group_code: str) -> pd.DataFrame:
+    path = os.path.abspath(os.path.join(TRIAL_CHAR_DIR, f"{group_code}_GaitPrint_Trial_Characteristics.csv"))
+
+    if path in _TRIAL_CHAR_CACHE:
+        return _TRIAL_CHAR_CACHE[path]
+
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Trial characteristics CSV not found: {path}")
+
+    df = pd.read_csv(path, sep=";", engine="python", on_bad_lines="skip")
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    required = {"id", "day", "block", "trial", "direction"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns in {os.path.basename(path)}: {sorted(missing)}")
+
+    for col in ("id", "day", "block", "trial", "direction"):
+        df[col] = df[col].astype(str).str.strip()
+
+    # Normalize day/block/trial: "D01" -> "1", "01" -> "1"
+    df["day"] = df["day"].apply(_digits_str)
+    df["block"] = df["block"].apply(_digits_str)
+    df["trial"] = df["trial"].apply(_digits_str)
+
+    # direction to canonical
+    df["direction"] = df["direction"].str.lower()
+
+    _TRIAL_CHAR_CACHE[path] = df
+    return df
+
+def get_walking_direction(pid: str, group_code: str, day: str, block: str, trial: str) -> str | None:
+    df = _load_trial_characteristics(group_code)
+
+    sid = _pid_to_trialchar_id(pid, group_code)
+    day_k = _digits_str(day)       # "D01" -> "1"
+    block_k = _digits_str(block)   # "B02" -> "2"
+    trial_k = _digits_str(trial)   # "T03" -> "3"
+
+    m = df[
+        (df["id"] == sid) &
+        (df["day"] == day_k) &
+        (df["block"] == block_k) &
+        (df["trial"] == trial_k)
+    ]
+
+    if m.empty:
+        return None
+
+    return m.iloc[0]["direction"]
+
+def direction_to_numeric(direction: str | None) -> float:
+    if direction is None:
+        return np.nan
+    d = str(direction).strip().lower()
+    if d == "clockwise":
+        return 1.0
+    if d == "counterclockwise":
+        return 0.0
+    return np.nan
+
+
 # ─── Tensor format  ─────────────────────────────────────────────────
 def _encode_metadata_to_numeric(meta_dict: dict) -> np.ndarray:
     """
     Converts metadata from formats like 'S039', 'G01', 'D02', 'B03', 'T03'
     to integer numerical values [39, 1, 2, 3, 3].
+    If meta_dict has 'direction_num', appends it.
     
     Args:
         meta_dict: Dictionary with keys:
@@ -772,119 +1008,286 @@ def _encode_metadata_to_numeric(meta_dict: dict) -> np.ndarray:
         np.ndarray: Array of shape (5,) with the corresponding numerical values.
     """
     numeric_values = []
-    for key in ['patient_id', 'group', 'day', 'block', 'trial']:
-        value = meta_dict[key]
-        # Extracts all digits and converts them to an integer
-        digits = int(re.sub(r'\D', '', value))
+    for key in ["patient_id", "group", "day", "block", "trial"]:
+        value = str(meta_dict[key])
+        digits = int(re.sub(r"\D", "", value))
         numeric_values.append(digits)
-    
-    return np.array(numeric_values, dtype=int)
 
-def save_patient_preprocessed_tensors(pid: str,
-                                     group_code: str,
-                                     target_length: int,
-                                     num_kinematic_variables: int,
-                                     global_scaler,
-                                     subfolder_name: str = "preprocessed",
-                                     verbose: bool = True):
+    if "direction_num" in meta_dict:
+        numeric_values.append(float(meta_dict["direction_num"]))
+
+    return np.array(numeric_values, dtype=np.float32)
+
+
+
+def purge_preprocessed_folder(patient_base: str,
+                              subfolder_name: str = "preprocessed",
+                              pattern: str = "*_preprocessed.npy",
+                              verbose: bool = True) -> int:
     """
-    Processes all trimmed trials for a patient:
-    1. Temporally normalizes each cycle using temporal_normalization_GC.
-    2. Applies feature normalization using the fitted global_scaler.
-    3. Encodes and appends metadata columns (now includes cycle_in_trial).
-    4. Saves the final 3D tensor per trial as .npy in a patient subfolder.
+    Deletes old preprocessed .npy files inside patient/<subfolder_name>.
+    Returns number of deleted files.
+    """
+    folder = os.path.join(patient_base, subfolder_name)
+    if not os.path.isdir(folder):
+        return 0
+
+    files = glob.glob(os.path.join(folder, pattern))
+    n = 0
+    for f in files:
+        try:
+            os.remove(f)
+            n += 1
+        except OSError:
+            pass
+
+    if verbose and n > 0:
+        print(f"[CLEAN] Removed {n} files from {folder} ({pattern})")
+    return n
+
+
+def save_patient_preprocessed_tensors(
+    pid: str,
+    group_code: str,
+    target_length: int,
+    num_kinematic_variables: int,
+    global_scaler,
+    subfolder_name: str = "preprocessed",
+    verbose: bool = True,
+    debug_first_trials: int = 0,
+    debug_first_cycles: int = 0,
+    purge_old: bool = False,
+):
+    """
+    Processes all trimmed_sc trials for a patient and saves per-trial tensors as .npy.
+
+    Steps:
+    1) Load & clean CSV.
+    2) Drop 'time' column (case-insensitive).
+    3) Get trial-level walking direction; skip if missing/unknown.
+    4) Temporal normalize cycles (segmentation inside temporal_normalization_GC).
+    5) Feature-scale with global_scaler.
+    6) Append metadata columns (direction + cycle_in_trial).
+    7) Atomic save .npy + write a .done.json manifest for resumability.
 
     Metadata columns appended (order):
-      [patient_id, group, day, block, trial, cycle_in_trial]
+      [patient_id, group, day, block, trial, direction, cycle_in_trial]
+
+    Resumability:
+      If both <trial>_preprocessed.npy and <trial>.done.json exist and match expected dims,
+      the trial is skipped (safe resume after interruptions).
 
     Args:
         pid: Patient identifier (e.g., "S039").
         group_code: Group code (must exist in base_folders).
         target_length: Number of timesteps per cycle after temporal normalization.
-        num_kinematic_variables: Number of kinematic variables (e.g., 321).
+        num_kinematic_variables: Number of kinematic variables AFTER dropping time.
         global_scaler: Fitted scaler with .transform().
-        subfolder_name: Name of subfolder under patient to save outputs.
-        verbose: Print progress messages.
+        subfolder_name: Output subfolder under patient.
+        verbose: Print progress.
+        debug_first_trials: Print debug info for first N processed trials per subject.
+        debug_first_cycles: Print first N cycle_in_trial ids for debug trials.
+        purge_old: If True, deletes old *_preprocessed.npy in output folder before processing.
     """
     import os
+    import json
+    import time
     import numpy as np
 
     if group_code not in base_folders:
         raise ValueError(f"Group '{group_code}' not found in base_folders.")
 
     patient_base = os.path.join(base_folders[group_code], pid)
-    trimmed_folder = os.path.join(patient_base, "trimmed")
+    out_folder = os.path.join(patient_base, subfolder_name)
+    os.makedirs(out_folder, exist_ok=True)
+
+    trimmed_folder = os.path.join(patient_base, "trimmed_sc")
     if not os.path.isdir(trimmed_folder):
         if verbose:
             print(f"[WARN] No trimmed data for {pid} in {trimmed_folder}. Skipping.")
         return
 
-    out_folder = os.path.join(patient_base, subfolder_name)
-    os.makedirs(out_folder, exist_ok=True)
+    # Optional: delete old outputs (only once per patient run)
+    if purge_old:
+        purge_preprocessed_folder(patient_base, subfolder_name=subfolder_name, verbose=verbose)
+
     if verbose:
         print(f"[INFO] Saving preprocessed tensors to {out_folder}")
 
+    def _trial_paths(pid_, day_, block_, trial_):
+        base = os.path.join(out_folder, f"{pid_}_{day_}_{block_}_{trial_}")
+        npy_path  = base + "_preprocessed.npy"
+        tmp_path  = base + "_preprocessed.tmp.npy"
+        done_path = base + ".done.json"
+        return npy_path, tmp_path, done_path
+
+    def _is_trial_done(npy_path: str, done_path: str, expected_cdim: int) -> bool:
+        if not (os.path.isfile(npy_path) and os.path.isfile(done_path)):
+            return False
+        try:
+            arr = np.load(npy_path, mmap_mode="r")
+            if arr.ndim != 3:
+                return False
+            if arr.shape[1] != target_length:
+                return False
+            if arr.shape[2] != expected_cdim:
+                return False
+            with open(done_path, "r") as f:
+                _ = json.load(f)
+            return True
+        except Exception:
+            return False
+
+    debug_trials_done = 0
+
+    # Expected final channel dimension: features + meta(=7)
+    expected_cdim = int(num_kinematic_variables) + 7
+
+    # --- CHANGE 1: initialize final_path to avoid "referenced before assignment" ---
+    final_path = None
+
     for day, block, trial, filepath in iter_trial_paths(trimmed_folder, pid, group_code):
-        if not os.path.isfile(filepath):
+        try:
+            if not os.path.isfile(filepath):
+                if verbose:
+                    print(f"  [WARN] Missing file: {filepath}")
+                continue
+
+            # Decide whether to print debug info for this trial (only for the first N processed trials)
+            do_debug = (debug_first_trials > 0) and (debug_trials_done < debug_first_trials)
+
+            # Resume check (skip already completed trials)
+            final_path, tmp_path, done_path = _trial_paths(pid, day, block, trial)
+            if _is_trial_done(final_path, done_path, expected_cdim=expected_cdim):
+                if verbose:
+                    print(f"  [SKIP] done: {os.path.basename(final_path)}")
+                continue
+
+            df_trial = load_and_clean_csv(filepath)
+            if df_trial.empty:
+                if verbose:
+                    print(f"[SKIP] Raw trial discarded (NaNs) → {os.path.basename(filepath)}")
+                continue
+
+            if df_trial.isna().any().any():
+                print(f"[ERROR] Still NaNs in {os.path.basename(filepath)}!")
+                continue
+
+            # --- Remove time column (IMPORTANT) ---
+            time_cols = [c for c in df_trial.columns if c.lower() == "time"]
+            if time_cols:
+                df_trial = df_trial.drop(columns=time_cols)
+                if do_debug and verbose:
+                    print("  [DEBUG] Removed time column")
+
+            # ---- Trial-level walking direction (skip early if missing/unknown) ----
+            direction_str = get_walking_direction(pid, group_code, day, block, trial)
+            direction_num = direction_to_numeric(direction_str)
+
+            if do_debug and verbose:
+                print(f"  [DEBUG] {pid} {day} {block} {trial} direction={direction_str} -> {direction_num}")
+
+            if not np.isfinite(direction_num):
+                if verbose:
+                    print(f"[SKIP] direction not found/unknown for {pid} {day} {block} {trial} -> {direction_str}")
+                continue
+
+            # 1) Temporal normalization per cycle (segmentation happens inside)
+            kin_df = df_trial.iloc[:, :num_kinematic_variables]
+            if kin_df.shape[1] != num_kinematic_variables:
+                if verbose:
+                    print(f"  [SKIP] kinematic cols mismatch in {os.path.basename(filepath)} "
+                          f"(got {kin_df.shape[1]}, expected {num_kinematic_variables})")
+                continue
+
+            tensor_cycles = temporal_normalization_GC(kin_df, target_length)
+            if tensor_cycles.size == 0:
+                if verbose:
+                    print(f"  [WARN] No cycles in {filepath}")
+                continue
+
+            # 2) Feature normalization
+            n_cycles, _, _ = tensor_cycles.shape
+            flat = tensor_cycles.reshape(-1, num_kinematic_variables)
+            scaled_flat = global_scaler.transform(flat)
+            scaled_cycles = scaled_flat.reshape(n_cycles, target_length, num_kinematic_variables).astype(np.float32, copy=False)
+
+            if do_debug and verbose:
+                print(f"  [DEBUG] n_cycles={n_cycles}")
+
+            # 3) Metadata encoding (base meta per trial) + cycle_in_trial (per cycle)
+            base_meta = _encode_metadata_to_numeric({
+                "patient_id": pid,
+                "group": group_code,
+                "day": day,
+                "block": block,
+                "trial": trial,
+                "direction_num": direction_num,
+            })  # shape: (6,) because direction_num appended
+
+            cycle_in_trial = np.arange(n_cycles, dtype=np.float32)[:, None]  # (n_cycles, 1)
+
+            if do_debug and verbose and debug_first_cycles > 0:
+                shown = cycle_in_trial[:debug_first_cycles, 0].astype(int).tolist()
+                print(f"  [DEBUG] cycle_in_trial first {debug_first_cycles}/{n_cycles}: {shown}")
+
+            base_meta_mat = np.tile(np.asarray(base_meta, dtype=np.float32)[None, :], (n_cycles, 1))  # (n_cycles, 6)
+            cycle_meta = np.concatenate([base_meta_mat, cycle_in_trial], axis=1)  # (n_cycles, 7)
+
+            meta_tensor = np.tile(cycle_meta[:, None, :], (1, target_length, 1))  # (n_cycles, T, 7)
+
+            # 4) Concatenate features + metadata
+            final_tensor = np.concatenate(
+                (scaled_cycles, meta_tensor.astype(np.float32, copy=False)),
+                axis=2,
+            )
+
+            # Sanity check
+            if final_tensor.shape[2] != expected_cdim:
+                if verbose:
+                    print(f"  [ERROR] Unexpected c_dim for {os.path.basename(filepath)}: "
+                          f"{final_tensor.shape[2]} (expected {expected_cdim})")
+                continue
+
+            # 5) Atomic save .npy
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
+            np.save(tmp_path, final_tensor)
+            os.replace(tmp_path, final_path)
+
+            # 6) Write .done.json manifest
+            payload = {
+                "file": os.path.basename(final_path),
+                "pid": pid,
+                "group": group_code,
+                "day": day,
+                "block": block,
+                "trial": trial,
+                "shape": [int(x) for x in final_tensor.shape],
+                "num_kinematic_variables": int(num_kinematic_variables),
+                "meta_cols": int(cycle_meta.shape[1]),
+                "direction_str": direction_str,
+                "direction_num": float(direction_num),
+                "created_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+            }
+            with open(done_path, "w") as f:
+                json.dump(payload, f, indent=2)
+
             if verbose:
-                print(f"  [WARN] Missing file: {filepath}")
+                print(f"  [OK] {os.path.basename(final_path)} -> shape {final_tensor.shape} (meta_cols={cycle_meta.shape[1]})")
+
+            if do_debug:
+                debug_trials_done += 1
+
+        except Exception as e:
+            # --- CHANGE 2: robust error message even if final_path not assigned ---
+            name = os.path.basename(final_path) if final_path else os.path.basename(filepath)
+            print(f"[ERROR] {pid}: {name}: {e}")
             continue
-
-        df_trial = load_and_clean_csv(filepath)
-        if df_trial.empty:
-            if verbose:
-                print(f"[SKIP] Raw trial discarded (NaNs) → {os.path.basename(filepath)}")
-            continue
-
-        if df_trial.isna().any().any():
-            print(f"[ERROR] ¡Todavía NaNs en {os.path.basename(filepath)}!")
-            continue
-
-        # 1) Temporal normalization per cycle (segmentation happens inside)
-        kin_df = df_trial.iloc[:, :num_kinematic_variables]
-        tensor_cycles = temporal_normalization_GC(kin_df, target_length)
-        if tensor_cycles.size == 0:
-            if verbose:
-                print(f"  [WARN] No cycles in {filepath}")
-            continue
-
-        # 2) Feature normalization
-        n_cycles, _, _ = tensor_cycles.shape
-        flat = tensor_cycles.reshape(-1, num_kinematic_variables)
-        scaled_flat = global_scaler.transform(flat)
-        scaled_cycles = scaled_flat.reshape(n_cycles, target_length, num_kinematic_variables)
-
-        # 3) Metadata encoding (base meta per trial) + cycle_in_trial (per cycle)
-        base_meta = _encode_metadata_to_numeric({
-            "patient_id": pid,
-            "group": group_code,
-            "day": day,
-            "block": block,
-            "trial": trial
-        })  # shape: (M_base,)
-
-        # cycle index within this trial: 0..n_cycles-1
-        cycle_in_trial = np.arange(n_cycles, dtype=np.float32)[:, None]  # (n_cycles, 1)
-
-        # make per-cycle meta matrix: (n_cycles, M_base + 1)
-        base_meta_mat = np.tile(np.asarray(base_meta, dtype=np.float32)[None, :], (n_cycles, 1))
-        cycle_meta = np.concatenate([base_meta_mat, cycle_in_trial], axis=1)  # (n_cycles, M_base+1)
-
-        # expand to (n_cycles, target_length, M_meta)
-        meta_tensor = np.tile(cycle_meta[:, None, :], (1, target_length, 1))
-
-        # 4) Concatenate features + metadata
-        final_tensor = np.concatenate((scaled_cycles.astype(np.float32, copy=False),
-                                       meta_tensor.astype(np.float32, copy=False)),
-                                      axis=2)
-
-        # 5) Save
-        fname = f"{pid}_{day}_{block}_{trial}_preprocessed.npy"
-        np.save(os.path.join(out_folder, fname), final_tensor)
-
-        if verbose:
-            # meta dims = len(base_meta)+1
-            print(f"  [OK] {fname} -> shape {final_tensor.shape} (meta_cols={cycle_meta.shape[1]})")
 
 def clean_and_save_trial(input_path: str, eps: float = 1e-8) -> bool:
     """
@@ -895,6 +1298,7 @@ def clean_and_save_trial(input_path: str, eps: float = 1e-8) -> bool:
         True if at least one cycle remains and file is kept,
         False if all cycles were corrupt (file removed).
     """
+    import os 
     arr = np.load(input_path).astype(np.float32)
     # Keep only fully finite cycles
     mask = np.isfinite(arr).all(axis=(1, 2))
@@ -918,6 +1322,8 @@ def preprocess_all_groups_and_patients(
     subfolder_name: str = "preprocessed",
     verbose: bool = False,
     groups_to_process: list[str] | None = None,
+    debug_first_trials=2,
+    debug_first_cycles=5
 ):
     """
     Applies save_patient_preprocessed_tensors to every patient in every group,
@@ -930,43 +1336,45 @@ def preprocess_all_groups_and_patients(
         subfolder_name: Subfolder name where preprocessed .npy are saved.
         verbose: Print progress.
     """
+    import os
+
     for group_code, group_path in base_folders.items():
         if groups_to_process is not None and group_code not in groups_to_process:
             continue
         if verbose:
             print(f"\n[INFO] Processing group: {group_code}")
-        patient_ids = [d for d in os.listdir(group_path)
-                        if os.path.isdir(os.path.join(group_path, d))]
+
+        # --- CHANGE 3: deterministic order ---
+        patient_ids = sorted([d for d in os.listdir(group_path)
+                              if os.path.isdir(os.path.join(group_path, d))])
 
         for pid in patient_ids:
             try:
                 if verbose:
                     print(f"[INFO]  Patient: {pid}")
-                # 1) Save raw preprocessed tensors for the patient
+                # 1) Save raw preprocessed tensors for the patient (resumable by trial)
                 save_patient_preprocessed_tensors(
-                    pid, group_code,
-                    target_length,
-                    num_kinematic_variables,
-                    global_scaler,
-                    subfolder_name,
-                    verbose
+                    pid=pid,
+                    group_code=group_code,
+                    target_length=target_length,
+                    num_kinematic_variables=num_kinematic_variables,
+                    global_scaler=global_scaler,
+                    subfolder_name=subfolder_name,
+                    verbose=verbose,
+                    debug_first_trials=debug_first_trials,
+                    debug_first_cycles=debug_first_cycles,
+                    purge_old=False,
                 )
 
                 # 2) Clean each .npy in the subfolder
                 pre_dir = os.path.join(group_path, pid, subfolder_name)
-                for fname in os.listdir(pre_dir):
-                    if fname.endswith("_preprocessed.npy"):
-                        inp = os.path.join(pre_dir, fname)
-                        ok = clean_and_save_trial(inp)
-                        # Print only when an entire file was discarded
-                        if not ok:
-                            print(f"[CLEAN] Discarded corrupt file: {os.path.basename(inp)}")
+                if os.path.isdir(pre_dir):
+                    for fname in os.listdir(pre_dir):
+                        if fname.endswith("_preprocessed.npy"):
+                            inp = os.path.join(pre_dir, fname)
+                            ok = clean_and_save_trial(inp)
+                            if not ok:
+                                print(f"[CLEAN] Discarded corrupt file: {os.path.basename(inp)}")
+
             except Exception as e:
                 print(f"[ERROR] Patient {pid}: {e}")
-
-
-
-
-
-
-
