@@ -238,9 +238,9 @@ class MultiSubjectGaitBatchIterable2(IterableDataset):
         return_meta=True,
         shuffle_subjects=True,
         seed=42,
-        feat_dim=321,
+        feat_dim=336,
         t_steps=100,
-        meta_dim=5,
+        meta_dim=7,
         infinite=True,
         require_full_batch=True,
 
@@ -733,9 +733,9 @@ class MultiSubjectGaitBatchIterable(IterableDataset):
         return_meta=True,
         shuffle_subjects=True,
         seed=42,
-        feat_dim=321,
+        feat_dim=336,
         t_steps=100,
-        meta_dim=5,
+        meta_dim=7,
         infinite=True,
         require_full_batch=True,
     ):
@@ -1431,7 +1431,7 @@ class LSTMConvAutoencoder(nn.Module):
         return (recon, z) if return_z else recon
 
 class SemiSupAE(nn.Module):
-    def __init__(self, steps=100, in_dim=321, latent=128,
+    def __init__(self, steps=100, in_dim=336, latent=128,
                  n_group=2, n_nuisance=None, n_subjects=None, grl_lambda=1.0):
         super().__init__()
         self.encoder = BiLSTMEncoder(in_dim=in_dim, latent=latent)
