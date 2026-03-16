@@ -59,3 +59,11 @@ corr_spearman_test_sample.npy
 HDBSCAN_labels61440.npy
 MI_test_sample.npy
 zarr
+
+
+bayesH_py.cpython-311-darwin.so
+bayesH_wrapp.zip
+bayesH_wrapp/
+best_model.pth
+best_model_pro.pth
+.DS_Store 
