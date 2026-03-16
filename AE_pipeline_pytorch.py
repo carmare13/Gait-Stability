@@ -706,7 +706,521 @@ class MultiSubjectGaitBatchIterable2(IterableDataset):
             yield from self._iter_once(z, rng, worker_info)
 
 
+class MultiSubjectGaitBatchIterable2NC(IterableDataset):
+    """
+    This class ignores the Contact_LT and Contact_RT columns 
+    Multi-subject batcher for Zarr store shaped like:
+      data [N, T=100, C=feat_dim + meta_dim]
+    where meta columns are stored after the features along the last dimension.
 
+    It samples `patients_per_batch` subjects and `samples_per_patient` cycles per subject.
+
+    Yields:
+      feat:     [B, T, feat_dim] float32
+      meta0:    [B, meta_dim]   float32 (from t=0 only) as stored in zarr
+      cycle_id: [B] int64 (global cycle indices)
+    """
+
+    def __init__(
+        self,
+        store_path,
+        subject_slices_json,
+        patients_per_batch=16,
+        samples_per_patient=16,
+        return_meta=True,
+        shuffle_subjects=True,
+        seed=42,
+        feat_dim=336,
+        t_steps=100,
+        meta_dim=7,
+        infinite=True,
+        require_full_batch=True,
+
+        # --- sampling options ---
+        no_replace_within_subject=True,
+        trial_slices_json=None,          # sid -> trial -> [lo,hi)
+        trial_balanced=True,
+        trial_day_slices_json=None,      # sid -> trial -> day -> [lo,hi)
+        day_balanced=True,
+        use_bin_sampling=True,           # for trial-day balancing (fast + diverse)
+        sort_indices_for_io=True,
+        keep_feature_idx=None,   # 
+        drop_feature_idx=None,   # list of feature indices to drop (e.g. contact columnns [143, 228]
+    ):
+        super().__init__()
+        self.store_path = str(store_path)
+        self.return_meta = bool(return_meta)
+
+        self.patients_per_batch = int(patients_per_batch)
+        self.samples_per_patient = int(samples_per_patient)
+        self.bs = self.patients_per_batch * self.samples_per_patient
+
+        self.shuffle_subjects = bool(shuffle_subjects)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        self.feat_dim = int(feat_dim)
+        self.meta_dim = int(meta_dim)
+        self.t_steps = int(t_steps)
+
+        self.infinite = bool(infinite)
+        self.require_full_batch = bool(require_full_batch)
+
+        self.no_replace_within_subject = bool(no_replace_within_subject)
+        self.trial_balanced = bool(trial_balanced)
+        self.day_balanced = bool(day_balanced)
+        self.use_bin_sampling = bool(use_bin_sampling)
+        self.sort_indices_for_io = bool(sort_indices_for_io)
+
+        # feature filtering
+        self.keep_feature_idx = None
+
+        if keep_feature_idx is not None and drop_feature_idx is not None:
+            raise ValueError("Use only one of keep_feature_idx or drop_feature_idx")
+
+        if keep_feature_idx is not None:
+            self.keep_feature_idx = np.asarray(keep_feature_idx, dtype=np.int64)
+
+        elif drop_feature_idx is not None:
+            drop_feature_idx = set(int(i) for i in drop_feature_idx)
+            self.keep_feature_idx = np.asarray(
+                [i for i in range(self.feat_dim) if i not in drop_feature_idx],
+                dtype=np.int64
+            )
+
+        self.output_feat_dim = (
+            len(self.keep_feature_idx) if self.keep_feature_idx is not None else self.feat_dim
+        )
+
+        # subject -> [lo, hi)
+        obj = json.loads(Path(subject_slices_json).read_text())
+        self.slices = {int(k): (int(v[0]), int(v[1])) for k, v in obj.items()}
+        self.subjects = sorted(self.slices.keys())
+
+        # trial slices (optional)
+        self.trial_slices = None
+        if trial_slices_json is not None:
+            obj_t = json.loads(Path(trial_slices_json).read_text())
+            ts = {}
+            for sid_str, d in obj_t.items():
+                sid = int(sid_str)
+                ts[sid] = {int(tr_str): (int(v[0]), int(v[1])) for tr_str, v in d.items()}
+            self.trial_slices = ts
+
+        # trial-day slices (optional)  sid -> trial -> day -> (lo,hi)
+        self.trial_day_slices = None
+        if trial_day_slices_json is not None:
+            obj_td = json.loads(Path(trial_day_slices_json).read_text())
+            td = {}
+            for sid_str, tr_dict in obj_td.items():
+                sid = int(sid_str)
+                td[sid] = {}
+                for tr_str, day_dict in tr_dict.items():
+                    tr = int(tr_str)
+                    td[sid][tr] = {int(day): (int(v[0]), int(v[1])) for day, v in day_dict.items()}
+            self.trial_day_slices = td
+
+        # --- per-worker state for no-replace ---
+        self._perm_subj = None  # dict[sid] -> perm of local indices [0..n-1]
+        self._ptr_subj = None   # dict[sid] -> pointer
+        self._perm_trial = None # dict[(sid, trial)] -> perm
+        self._ptr_trial = None  # dict[(sid, trial)] -> pointer
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    @staticmethod
+    def _set_thread_safety():
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        try:
+            import numcodecs.blosc as nblosc
+            nblosc.set_nthreads(1)
+        except Exception:
+            pass
+
+    def _open_zarr(self):
+        try:
+            grp = zarr.open_consolidated(self.store_path, mode="r")
+            z = grp["data"]
+        except Exception:
+            z = zarr.open(self.store_path, mode="r")["data"]
+        return z
+
+    # -----------------------------
+    # Helpers
+    # -----------------------------
+    @staticmethod
+    def _sample_bins(lo, hi, k, rng):
+        """Pick k indices spread over [lo,hi) using k bins (diverse, simple)."""
+        n = hi - lo
+        if n <= 0:
+            return None
+        if n <= k:
+            base = np.arange(lo, hi, dtype=np.int64)
+            if base.size < k:
+                extra = rng.integers(lo, hi, size=(k - base.size), dtype=np.int64)
+                base = np.concatenate([base, extra])
+            return base
+
+        edges = np.linspace(lo, hi, num=k + 1, dtype=np.int64)
+        out = np.empty(k, dtype=np.int64)
+        for i in range(k):
+            a = int(edges[i])
+            b = int(edges[i + 1])
+            if b <= a:
+                b = min(a + 1, hi)
+            out[i] = int(rng.integers(a, b))
+        return out
+
+    # -----------------------------
+    # No-replacement state init
+    # -----------------------------
+    def _init_subject_state_if_needed(self, rng):
+        if (self._perm_subj is not None) and (self._ptr_subj is not None):
+            return
+        self._perm_subj = {}
+        self._ptr_subj = {}
+        for sid in self.subjects:
+            lo, hi = self.slices[sid]
+            n = hi - lo
+            if n > 0:
+                self._perm_subj[sid] = rng.permutation(n).astype(np.int64)
+                self._ptr_subj[sid] = 0
+
+    def _init_trial_state_if_needed(self, rng):
+        if self.trial_slices is None:
+            return
+        if (self._perm_trial is not None) and (self._ptr_trial is not None):
+            return
+        self._perm_trial = {}
+        self._ptr_trial = {}
+        for sid, trials in self.trial_slices.items():
+            for tr, (lo, hi) in trials.items():
+                n = hi - lo
+                if n > 0:
+                    self._perm_trial[(sid, tr)] = rng.permutation(n).astype(np.int64)
+                    self._ptr_trial[(sid, tr)] = 0
+
+    def _sample_no_replace_range(self, perm, ptr, lo, hi, k, rng):
+        n = hi - lo
+        if n <= 0:
+            return None, perm, ptr
+
+        if n < k:
+            base = lo + np.arange(n, dtype=np.int64)
+            extra = rng.integers(lo, hi, size=(k - n), dtype=np.int64)
+            return np.concatenate([base, extra]), perm, ptr
+
+        if ptr + k <= n:
+            idx_local = perm[ptr:ptr + k]
+            ptr = ptr + k
+            return lo + idx_local, perm, ptr
+
+        first = perm[ptr:]
+        perm2 = rng.permutation(n).astype(np.int64)
+        need = k - (n - ptr)
+        second = perm2[:need]
+        perm = perm2
+        ptr = need
+        return lo + np.concatenate([first, second]), perm, ptr
+
+    def _sample_subject_no_replace(self, sid, k, rng):
+        lo, hi = self.slices[sid]
+        perm = self._perm_subj.get(sid, None)
+        ptr = self._ptr_subj.get(sid, 0)
+        if perm is None:
+            return None
+        picks, perm, ptr = self._sample_no_replace_range(perm, ptr, lo, hi, k, rng)
+        self._perm_subj[sid] = perm
+        self._ptr_subj[sid] = ptr
+        return picks
+
+    def _sample_subject_trials_no_replace(self, sid, k, rng):
+        """Your previous trial-balanced no-replace sampler (kept)."""
+        trials = self.trial_slices.get(sid, None) if self.trial_slices is not None else None
+        if not trials:
+            return None
+
+        trial_ids = [tr for tr in sorted(trials.keys()) if (trials[tr][1] - trials[tr][0]) > 0]
+        if not trial_ids:
+            return None
+
+        picks_all = []
+
+        if not self.trial_balanced:
+            remaining = k
+            while remaining > 0 and trial_ids:
+                tr = int(rng.choice(trial_ids))
+                lo, hi = trials[tr]
+                key = (sid, tr)
+                perm = self._perm_trial.get(key, None)
+                if perm is None:
+                    n = hi - lo
+                    if n <= 0:
+                        trial_ids.remove(tr)
+                        continue
+                    perm = rng.permutation(n).astype(np.int64)
+                    self._perm_trial[key] = perm
+                    self._ptr_trial[key] = 0
+
+                ptr = self._ptr_trial[key]
+                got, perm2, ptr2 = self._sample_no_replace_range(perm, ptr, lo, hi, remaining, rng)
+                if got is None or got.size == 0:
+                    trial_ids.remove(tr)
+                    continue
+                self._perm_trial[key] = perm2
+                self._ptr_trial[key] = ptr2
+                picks_all.append(got)
+                remaining -= got.size
+        else:
+            ntr = len(trial_ids)
+            base = k // ntr
+            rem = k % ntr
+            trial_order = trial_ids.copy()
+            rng.shuffle(trial_order)
+
+            for tr in trial_order:
+                need = base + (1 if rem > 0 else 0)
+                if rem > 0:
+                    rem -= 1
+                if need <= 0:
+                    continue
+
+                lo, hi = trials[tr]
+                key = (sid, tr)
+                perm = self._perm_trial.get(key, None)
+                if perm is None:
+                    n = hi - lo
+                    if n <= 0:
+                        continue
+                    perm = rng.permutation(n).astype(np.int64)
+                    self._perm_trial[key] = perm
+                    self._ptr_trial[key] = 0
+
+                ptr = self._ptr_trial[key]
+                got, perm2, ptr2 = self._sample_no_replace_range(perm, ptr, lo, hi, need, rng)
+                if got is None or got.size == 0:
+                    continue
+                self._perm_trial[key] = perm2
+                self._ptr_trial[key] = ptr2
+                picks_all.append(got)
+
+            total_got = int(sum(x.size for x in picks_all))
+            remaining = k - total_got
+            if remaining > 0:
+                extra = self._sample_subject_no_replace(sid, remaining, rng)
+                if extra is not None and extra.size > 0:
+                    picks_all.append(extra)
+
+        if not picks_all:
+            return None
+        picks = np.concatenate(picks_all).astype(np.int64)
+        if picks.size > k:
+            picks = picks[:k]
+        return picks
+
+    def _sample_subject_trial_day_balanced_bins(self, sid, k, rng):
+        """
+        Uses trial_day_slices to spread picks across days (and trials).
+        This is SIMPLE and does not need pointer-state. Great for val/test determinism + diversity.
+        """
+        if self.trial_day_slices is None or sid not in self.trial_day_slices:
+            return None
+
+        # pools_by_day: day -> list[(lo,hi)] across trials
+        pools_by_day = {}
+        for tr, day_dict in self.trial_day_slices[sid].items():
+            for day, (lo, hi) in day_dict.items():
+                if (hi - lo) <= 0:
+                    continue
+                pools_by_day.setdefault(day, []).append((lo, hi))
+
+        days = sorted(pools_by_day.keys())
+        if not days:
+            return None
+
+        # allocate roughly evenly over days (handles your 1 subject missing day2 automatically)
+        base = k // len(days)
+        rem = k % len(days)
+
+        day_order = days.copy()
+        rng.shuffle(day_order)
+
+        picks = []
+        for d in day_order:
+            need = base + (1 if rem > 0 else 0)
+            if rem > 0:
+                rem -= 1
+            if need <= 0:
+                continue
+
+            pools = pools_by_day[d]
+            rng.shuffle(pools)
+
+            # distribute "need" across pools
+            per_pool = max(1, need // len(pools))
+            left = need
+
+            for (lo, hi) in pools:
+                take = min(per_pool, left)
+                got = self._sample_bins(lo, hi, take, rng)
+                if got is not None and got.size > 0:
+                    picks.append(got)
+                    left -= got.size
+                if left <= 0:
+                    break
+
+            # top-up if still missing
+            while left > 0:
+                lo, hi = pools[int(rng.integers(0, len(pools)))]
+                got = self._sample_bins(lo, hi, 1, rng)
+                if got is not None:
+                    picks.append(got)
+                    left -= 1
+
+        out = np.concatenate(picks).astype(np.int64)
+        if out.size > k:
+            out = out[:k]
+        return out
+
+    # -----------------------------
+    # Main iteration
+    # -----------------------------
+    def _iter_once(self, z, rng, worker_info):
+        subjects = self.subjects.copy()
+        if self.shuffle_subjects:
+            rng.shuffle(subjects)
+
+        batches = [
+            subjects[j:j + self.patients_per_batch]
+            for j in range(0, len(subjects) - self.patients_per_batch + 1, self.patients_per_batch)
+        ]
+
+        if worker_info:
+            wid = worker_info.id
+            nw = worker_info.num_workers
+            batches = batches[wid::nw]
+
+        # torch generator for deterministic shuffles (esp. val/test)
+        # tied to seed+epoch+worker
+        gen = torch.Generator()
+        gen.manual_seed(int(self.seed + 100_000 * self.epoch + (worker_info.id if worker_info else 0)))
+
+        for batch_subj in batches:
+            idxs_list = []
+
+            for sid in batch_subj:
+                lo, hi = self.slices[sid]
+                n_cycles = hi - lo
+                if n_cycles <= 0:
+                    if self.require_full_batch:
+                        idxs_list = []
+                        break
+                    else:
+                        continue
+
+                if self.no_replace_within_subject:
+                    # Priority: trial-day balancing (if provided)
+                    if (self.trial_day_slices is not None) and self.day_balanced and self.use_bin_sampling:
+                        picks = self._sample_subject_trial_day_balanced_bins(sid, self.samples_per_patient, rng)
+                        if picks is None:
+                            # fallback: trial-level no-replace if available
+                            if self.trial_slices is not None:
+                                picks = self._sample_subject_trials_no_replace(sid, self.samples_per_patient, rng)
+                            else:
+                                picks = self._sample_subject_no_replace(sid, self.samples_per_patient, rng)
+
+                    # Else: trial-level no-replace if trial_slices exists
+                    elif self.trial_slices is not None:
+                        picks = self._sample_subject_trials_no_replace(sid, self.samples_per_patient, rng)
+                        if picks is None:
+                            picks = self._sample_subject_no_replace(sid, self.samples_per_patient, rng)
+
+                    # Else: subject-level no-replace
+                    else:
+                        picks = self._sample_subject_no_replace(sid, self.samples_per_patient, rng)
+
+                else:
+                    # Old behavior: random window / replacement
+                    if n_cycles >= self.samples_per_patient:
+                        start = rng.integers(lo, hi - self.samples_per_patient + 1)
+                        picks = np.arange(start, start + self.samples_per_patient, dtype=np.int64)
+                    else:
+                        picks = rng.integers(lo, hi, size=self.samples_per_patient, dtype=np.int64)
+
+                if picks is None or picks.size == 0:
+                    if self.require_full_batch:
+                        idxs_list = []
+                        break
+                    else:
+                        continue
+
+                idxs_list.append(picks)
+
+            if not idxs_list:
+                continue
+
+            idxs = np.concatenate(idxs_list).astype(np.int64)
+            if self.require_full_batch and idxs.shape[0] != self.bs:
+                continue
+
+            # Sort indices for IO
+            if self.sort_indices_for_io:
+                order = np.argsort(idxs)
+                idxs_read = idxs[order]
+            else:
+                idxs_read = idxs
+
+            data = z.get_orthogonal_selection((idxs_read, slice(None), slice(None)))
+            if data.dtype != np.float32:
+                data = data.astype("float32", copy=False)
+
+            feat = torch.from_numpy(data[:, :, :self.feat_dim]).contiguous()
+            if self.keep_feature_idx is not None:
+                keep_idx = torch.as_tensor(self.keep_feature_idx, dtype=torch.long)
+                feat = feat[:, :, keep_idx].contiguous()
+
+            meta0 = None
+            if self.return_meta:
+                meta0 = torch.from_numpy(
+                    data[:, 0, self.feat_dim:self.feat_dim + self.meta_dim]
+                ).contiguous()
+
+            cycle_id = torch.from_numpy(idxs_read).to(torch.int64)
+
+            # Shuffle after loading
+            perm = torch.randperm(feat.shape[0], generator=gen)
+            feat = feat[perm]
+            cycle_id = cycle_id[perm]
+            if meta0 is not None:
+                meta0 = meta0[perm]
+
+            if self.return_meta:
+                yield feat, meta0, cycle_id
+            else:
+                yield feat, feat, cycle_id
+
+    def __iter__(self):
+        self._set_thread_safety()
+        z = self._open_zarr()
+
+        worker_info = get_worker_info()
+        wid = worker_info.id if worker_info else 0
+
+        rng = np.random.default_rng(self.seed + 100_000 * self.epoch + wid)
+
+        # init pointer-state only needed for no-replace samplers (subject/trial)
+        if self.no_replace_within_subject:
+            self._init_subject_state_if_needed(rng)
+            self._init_trial_state_if_needed(rng)
+
+        if self.infinite:
+            while True:
+                yield from self._iter_once(z, rng, worker_info)
+                self.epoch += 1
+                rng = np.random.default_rng(self.seed + 100_000 * self.epoch + wid)
+        else:
+            yield from self._iter_once(z, rng, worker_info)
 
 
 
