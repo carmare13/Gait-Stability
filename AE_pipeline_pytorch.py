@@ -135,85 +135,105 @@ class GaitBatchIterable(IterableDataset):
                 feat = torch.tensor(feat_np, dtype=torch.float32)
                 yield feat, feat, cycle_id
 
+class GaitBatchIterableNC(IterableDataset):
+    def __init__(
+        self,
+        store_path,
+        batch_size,
+        return_meta=False,
+        shuffle=False,
+        seed=42,
+        feat_dim=336,
+        meta_start=336,
+        meta_end=343,
+        ignore_feature_indices=None,
+    ):
+        base = Path(__file__).resolve().parent
+        p = Path(store_path)
 
-# This adds epoch-based shuffling by incorporating the epoch number into the RNG seed.
-# class GaitBatchIterable(IterableDataset):
-#     def __init__(self, store_path, batch_size, return_meta=False,
-#                  shuffle=False, seed=42):
-#         self.store_path = store_path
-#         self.bs = batch_size
-#         self.return_meta = return_meta
-#         self.shuffle = shuffle
-#         self.seed = seed
-#         self.epoch = 0  # <- NEW
+        self.store_path = store_path
+        self.bs = batch_size
+        self.return_meta = return_meta
+        self.shuffle = shuffle
+        self.seed = seed
 
-#     def set_epoch(self, epoch: int):
-#         """Call this at the start of each epoch (training only)."""
-#         self.epoch = int(epoch)
+        self.feat_dim = feat_dim
+        self.meta_start = meta_start
+        self.meta_end = meta_end
 
-#     def __iter__(self):
-#         import os, numpy as np, torch, zarr
-#         from torch.utils.data import get_worker_info
+        # índices de features a ignorar, por ejemplo columnas de contacto
+        self.ignore_feature_indices = sorted(set(ignore_feature_indices or []))
 
-#         os.environ.setdefault("OMP_NUM_THREADS", "1")
-#         try:
-#             import numcodecs.blosc as nblosc
-#             nblosc.set_nthreads(1)
-#         except Exception:
-#             pass
+        # construir columnas a conservar
+        all_idx = np.arange(self.feat_dim)
+        if len(self.ignore_feature_indices) > 0:
+            self.keep_feature_indices = np.setdiff1d(
+                all_idx,
+                np.array(self.ignore_feature_indices, dtype=np.int64)
+            )
+        else:
+            self.keep_feature_indices = all_idx
 
-#         try:
-#             grp = zarr.open_consolidated(self.store_path, mode="r")
-#             z = grp["data"]
-#         except Exception:
-#             z = zarr.open(self.store_path, mode="r")["data"]
+    def __iter__(self):
+        import os, numpy as np, torch, zarr
+        from torch.utils.data import get_worker_info
 
-#         n = int(z.shape[0])
+        # Limitar hilos
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        try:
+            import numcodecs.blosc as nblosc
+            nblosc.set_nthreads(1)
+        except Exception:
+            pass
 
-#         worker_info = get_worker_info()
-#         wid = worker_info.id if worker_info else 0
+        # Abrir Zarr
+        try:
+            grp = zarr.open_consolidated(self.store_path, mode="r")
+            z = grp["data"]
+        except Exception:
+            z = zarr.open(self.store_path, mode="r")["data"]
 
-#         # NEW: epoch enters the RNG seed so shuffle changes each epoch but is reproducible
-#         # Use a large multiplier to avoid collisions across epochs.
-#         base_seed = int(self.seed) + 100_000 * int(self.epoch) + int(wid)
-#         rng = np.random.default_rng(base_seed)
+        n = int(z.shape[0])
 
-#         batch_starts = np.arange(0, n, self.bs, dtype=np.int64)
-#         if self.shuffle:
-#             rng.shuffle(batch_starts)
+        worker_info = get_worker_info()
+        base_seed = self.seed
+        if worker_info:
+            base_seed = self.seed + worker_info.id
+        rng = np.random.default_rng(base_seed)
 
-#         # Deterministic split across workers
-#         if worker_info:
-#             nw = worker_info.num_workers
-#             total = len(batch_starts)
-#             per, rem = total // nw, total % nw
-#             start = wid * per + min(wid, rem)
-#             end = start + per + (1 if wid < rem else 0)
-#             batch_starts = batch_starts[start:end]
+        batch_starts = np.arange(0, n, self.bs, dtype=np.int64)
+        if self.shuffle:
+            rng.shuffle(batch_starts)
 
-#         for s in batch_starts:
-#             lo = int(s)
-#             hi = int(min(s + self.bs, n))
+        if worker_info:
+            wid, nw = worker_info.id, worker_info.num_workers
+            total = len(batch_starts)
+            per, rem = total // nw, total % nw
+            start = wid * per + min(wid, rem)
+            end = start + per + (1 if wid < rem else 0)
+            batch_starts = batch_starts[start:end]
 
-#             data = z[lo:hi].astype("float32", copy=True)
+        for s in batch_starts:
+            lo = int(s)
+            hi = int(min(s + self.bs, n))
 
-#             feat_np = data[:, :, :321]
-#             feat = torch.tensor(feat_np, dtype=torch.float32)
+            data = z[lo:hi].astype("float32", copy=True)
 
-#             if self.return_meta:
-#                 meta_np = data[:, :, 321:]
-#                 meta = torch.tensor(meta_np, dtype=torch.float32)
-#                 yield feat, meta
-#             else:
-#                 yield feat, feat                
-# USE 
-# train_ds = GaitBatchIterable(train_path, micro_batch, return_meta=False, shuffle=True, seed=42)
-# train_loader = DataLoader(train_ds, batch_size=None, num_workers=num_workers, persistent_workers=False)
+            # Features originales
+            feat_np = data[:, :, :self.feat_dim]
 
-# for epoch in range(num_epochs):
-#     train_ds.set_epoch(epoch)   # <- clave
-#     for xb, yb in train_loader:
-#         ...
+            # Ignorar columnas seleccionadas
+            feat_np = feat_np[:, :, self.keep_feature_indices]
+
+            feat = torch.tensor(feat_np, dtype=torch.float32)
+            cycle_id = torch.arange(lo, hi, dtype=torch.int64)
+
+            if self.return_meta:
+                meta_np = data[:, 0, self.meta_start:self.meta_end]
+                meta = torch.tensor(meta_np, dtype=torch.float32)
+                yield feat, meta, cycle_id
+            else:
+                yield feat, None, cycle_id
 
 class MultiSubjectGaitBatchIterable2(IterableDataset):
     """
@@ -1665,7 +1685,7 @@ class GRL(nn.Module):
     
 
 class BiLSTMEncoder(nn.Module):
-    def __init__(self, in_dim=321, hidden=128, latent=128):
+    def __init__(self, in_dim=336, hidden=128, latent=128):
         super().__init__()
         self.bilstm = nn.LSTM(input_size=in_dim, hidden_size=hidden,
                               num_layers=1, batch_first=True, bidirectional=True)
@@ -1673,14 +1693,27 @@ class BiLSTMEncoder(nn.Module):
             nn.Linear(2*hidden, latent),
             nn.LayerNorm(latent)
         )
-    def forward(self, x):  # x: [B, 100, 321]
-        h, _ = self.bilstm(x)         # [B, 100, 256]
-        h_last = h[:, -1, :]          # take last timestep  [B, 256]
-        z = self.to_latent(h_last)    # [B, 128]
+    # def forward(self, x):  # x: [B, 100, 321]
+    #     h, _ = self.bilstm(x)         # [B, 100, 256]
+    #     h_last = h[:, -1, :]          # take last timestep  [B, 256]
+    #     z = self.to_latent(h_last)    # [B, 128]
+    #     return z
+    
+    def forward(self, x):
+        # x shape: [Batch, 100, 336]
+        h, _ = self.bilstm(x)  # h shape: [Batch, 100, Hidden_Size]
+        
+        # --- CAMBIO AQUÍ ---
+        # En lugar de: h_last = h[:, -1, :]
+        # Usamos el promedio de toda la secuencia temporal
+        h_avg = torch.mean(h, dim=1)  # h_avg shape: [Batch, Hidden_Size]
+        
+        # Pasamos el promedio a la capa latente
+        z = self.to_latent(h_avg) 
         return z
 
 class LSTMDecoder(nn.Module):
-    def __init__(self, out_dim=321, hidden=128, steps=100, latent=128):
+    def __init__(self, out_dim=336, hidden=128, steps=100, latent=128):
         super().__init__()
         self.steps = steps
         self.init = nn.Linear(latent, hidden)
