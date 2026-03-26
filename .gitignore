@@ -71,6 +71,9 @@ best_model_pro.pth
 best_by_utility_baseline23march.pth
 best_by_utility_baseline24M.pth
 best_by_utility_baseline25M.pth
+best_by_utility_full_baseline25M.pth
+latents_AE_afterTraining_24M.pt
+latents_AE_afterTraining.pt
 
 indices_ok.npy
 matriz_dcor_age_3g.npy
