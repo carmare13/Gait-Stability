@@ -8,6 +8,7 @@
 *.pkl
 *.gz
 *.keras
+*.pdf
 
 # Ignorar carpeta de librería local
 NONAN_Library_main/
@@ -72,6 +73,16 @@ best_by_utility_baseline23march.pth
 best_by_utility_baseline24M.pth
 best_by_utility_baseline25M.pth
 best_by_utility_full_baseline25M.pth
+best_by_utility_baseline25M.pth 
+best_by_utility_baseline26M_v2.pth
+best_by_utility_baseline26M_v3.pth
+best_by_utility_baseline26M_v4.pth
+best_by_utility_baseline27M_1.pth
+best_by_utility_baseline27M.pth
+best_by_utility_baseline26M.pth
+best_by_val_full.pth
+
+
 latents_AE_afterTraining_24M.pt
 latents_AE_afterTraining.pt
 
